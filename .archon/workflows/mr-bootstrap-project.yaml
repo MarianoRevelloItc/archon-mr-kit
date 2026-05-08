@@ -743,6 +743,96 @@ nodes:
     depends_on: [verify]
 
   # ═══════════════════════════════════════════════════════════════
+  # PHASE 8b2: STACK-CONDITIONAL SKILLS
+  # Detect project stack and copy matching optional skills from the kit's
+  # _optional/ pool. Source priority:
+  #   1. $KIT_PATH (env var, if user pre-cloned the kit)
+  #   2. ~/.archon-mr-kit/ (auto-clone target)
+  #   3. fallback: download via curl from raw.githubusercontent.com
+  # All copy operations are idempotent (skip if dest exists).
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: scaffold-stack-skills
+    bash: |
+      set -e
+
+      # Resolve the kit source -------------------------------------------------
+      KIT_REPO="https://github.com/MarianoRevelloItc/archon-mr-kit.git"
+      KIT_RAW="https://raw.githubusercontent.com/MarianoRevelloItc/archon-mr-kit/main"
+
+      if [ -n "$KIT_PATH" ] && [ -d "$KIT_PATH/.claude/skills/_optional" ]; then
+        SRC="$KIT_PATH/.claude/skills/_optional"
+        echo "Using KIT_PATH=$KIT_PATH for optional skills"
+      elif [ -d "$HOME/.archon-mr-kit/.claude/skills/_optional" ]; then
+        SRC="$HOME/.archon-mr-kit/.claude/skills/_optional"
+        echo "Using ~/.archon-mr-kit cache for optional skills"
+        # Refresh cache best-effort (don't fail bootstrap if offline)
+        (cd "$HOME/.archon-mr-kit" && git pull --ff-only 2>&1 | head -3) || true
+      else
+        echo "Cloning kit cache to ~/.archon-mr-kit (first-run)"
+        if git clone --depth 1 "$KIT_REPO" "$HOME/.archon-mr-kit" 2>&1 | tail -3; then
+          SRC="$HOME/.archon-mr-kit/.claude/skills/_optional"
+        else
+          SRC=""
+          echo "WARNING: kit clone failed — will fall back to raw downloads per skill"
+        fi
+      fi
+
+      copy_skill() {
+        local skill_name="$1"
+        local dest=".claude/skills/$skill_name"
+        if [ -d "$dest" ]; then
+          echo "Skipped: $dest already exists"
+          return 0
+        fi
+        mkdir -p "$dest"
+        if [ -n "$SRC" ] && [ -f "$SRC/$skill_name/SKILL.md" ]; then
+          cp -R "$SRC/$skill_name/." "$dest/"
+          echo "Copied: $dest (from $SRC)"
+        else
+          # Fallback: curl SKILL.md from raw GitHub
+          if curl -fsSL "$KIT_RAW/.claude/skills/_optional/$skill_name/SKILL.md" -o "$dest/SKILL.md"; then
+            echo "Downloaded: $dest/SKILL.md (from raw.githubusercontent.com)"
+          else
+            echo "ERROR: could not source skill '$skill_name' — manual copy required"
+            rmdir "$dest" 2>/dev/null || true
+            return 1
+          fi
+        fi
+      }
+
+      # Frontend stack detection ----------------------------------------------
+      HAS_FRONTEND_FRAMEWORK="false"
+      for pkg in package.json frontend/package.json; do
+        if [ -f "$pkg" ]; then
+          if grep -qE '"(react|vue|svelte|solid-js|@angular/core)"' "$pkg" 2>/dev/null; then
+            HAS_FRONTEND_FRAMEWORK="true"
+            echo "Detected frontend framework in $pkg"
+            break
+          fi
+        fi
+      done
+
+      if [ "$HAS_FRONTEND_FRAMEWORK" = "true" ]; then
+        copy_skill "frontend-ui-engineering" || true
+        copy_skill "browser-testing-with-devtools" || true
+      else
+        echo "Skipped: no React/Vue/Svelte/Solid/Angular detected — frontend skills not copied"
+      fi
+
+      # CI detection ----------------------------------------------------------
+      if [ -d .github/workflows ] && [ -n "$(ls -A .github/workflows 2>/dev/null)" ]; then
+        copy_skill "ci-cd-and-automation" || true
+      else
+        echo "Skipped: no .github/workflows/ — ci-cd skill not copied (re-run after adding CI)"
+      fi
+
+      echo ""
+      echo "STACK_SKILLS_OK"
+    depends_on: [scaffold-docs]
+    timeout: 120000
+
+  # ═══════════════════════════════════════════════════════════════
   # PHASE 8c: TRACKING ISSUE — open a 'bootstrap-todo' issue for runbook completion
   # ═══════════════════════════════════════════════════════════════
 
@@ -835,4 +925,4 @@ nodes:
       5. Fill in the `bootstrap-todo` issue's runbook TODOs before first prod deploy.
       6. Start your first PRD: `archon workflow run mr-idea-to-prd --branch prd/{name} "{idea}"`
       ```
-    depends_on: [verify, scaffold-docs, bootstrap-todo-issue]
+    depends_on: [verify, scaffold-docs, scaffold-stack-skills, bootstrap-todo-issue]
