@@ -1,0 +1,37 @@
+name: template-smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate-kit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+
+      - name: Run kit validator on a copy
+        # Copy the template into a clean tmpfs-style directory and validate it there.
+        # This proves the validator works on a fresh checkout (no leftover artifacts)
+        # and would catch issues a `cp -r` user would also hit.
+        run: |
+          set -e
+          TMP="$RUNNER_TEMP/kit-smoke"
+          mkdir -p "$TMP"
+          cp -R . "$TMP/"
+          cd "$TMP"
+          bash scripts/test-bootstrap.sh

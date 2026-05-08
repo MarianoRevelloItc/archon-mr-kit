@@ -1,6 +1,7 @@
 ---
 description: Implement an issue using strict TDD (red → green per behavior). Reads investigation.md or plan.md, writes implementation.md.
 argument-hint: (no arguments — reads from workflow artifacts)
+requires_skills: [tdd]
 ---
 
 # MR TDD Implement
