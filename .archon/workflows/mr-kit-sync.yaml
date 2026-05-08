@@ -111,10 +111,13 @@ nodes:
         exit 0
       fi
 
-      # Verify both refs exist on the kit remote
+      # Verify both refs exist on the kit remote.
+      # If FROM tag doesn't exist (project predates v0.1.0 or invented version),
+      # treat BASE as EMPTY — every TARGET file becomes a Case A "new upstream file"
+      # and lands cleanly. The sentinel "__EMPTY__" is detected by three-way-merge.
       if ! git rev-parse --verify "refs/tags/v$FROM" >/dev/null 2>&1 && ! git rev-parse --verify "kit/$FROM" >/dev/null 2>&1; then
-        echo "WARNING: 'v$FROM' not a tag on kit. Trying 'kit/main' as base — this is best-effort."
-        BASE_REF="kit/main"
+        echo "INFO: 'v$FROM' not a tag on kit — treating BASE as empty (full kit landing)."
+        BASE_REF="__EMPTY__"
       else
         BASE_REF="v$FROM"
       fi
@@ -179,18 +182,32 @@ nodes:
       : > "$ARTIFACTS_DIR/.sync-conflict-list"
       : > "$ARTIFACTS_DIR/.sync-changed-list"
 
+      # Detect empty-BASE sentinel (set by resolve-target-version when FROM tag doesn't exist).
+      # In that case BASE is treated as a synthetic empty tree: every TARGET file lands as Case A.
+      EMPTY_BASE=0
+      if [ "$BASE_REF" = "__EMPTY__" ]; then
+        EMPTY_BASE=1
+        echo "Mode: empty-BASE sync (every TARGET file lands as Case A 'new upstream file')"
+      fi
+
       # Build the union of files at BASE_REF and TARGET_REF under each prefix
       for prefix in "${KIT_PATHS[@]}"; do
         # Files at TARGET (upstream wants these to exist)
         TARGET_FILES=$(git ls-tree -r --name-only "$TARGET_REF" -- "$prefix" 2>/dev/null || true)
-        # Files at BASE (we previously had these from upstream)
-        BASE_FILES=$(git ls-tree -r --name-only "$BASE_REF" -- "$prefix" 2>/dev/null || true)
+        # Files at BASE (we previously had these from upstream); empty if BASE is the sentinel
+        if [ "$EMPTY_BASE" = "1" ]; then
+          BASE_FILES=""
+        else
+          BASE_FILES=$(git ls-tree -r --name-only "$BASE_REF" -- "$prefix" 2>/dev/null || true)
+        fi
         # Union of both
         ALL_FILES=$(printf '%s\n%s\n' "$TARGET_FILES" "$BASE_FILES" | sort -u | sed '/^$/d')
 
         for f in $ALL_FILES; do
           IN_BASE=0; IN_TARGET=0; IN_OURS=0
-          git cat-file -e "$BASE_REF:$f" 2>/dev/null && IN_BASE=1 || true
+          if [ "$EMPTY_BASE" = "0" ]; then
+            git cat-file -e "$BASE_REF:$f" 2>/dev/null && IN_BASE=1 || true
+          fi
           git cat-file -e "$TARGET_REF:$f" 2>/dev/null && IN_TARGET=1 || true
           [ -f "$f" ] && IN_OURS=1 || true
 
@@ -315,7 +332,9 @@ nodes:
         gh label create kit-sync --color "5319E7" --description "Auto-opened by mr-kit-sync" || true
       fi
 
+      # Stage everything EXCEPT workflow scratch artifacts (.archon/artifacts/ is transient)
       git add -A
+      git reset -q -- .archon/artifacts/ 2>/dev/null || true
       if git diff --cached --quiet; then
         echo "No changes to commit (no upstream deltas applied)"
         # Bring KIT_VERSION back to source-of-truth on disk just in case

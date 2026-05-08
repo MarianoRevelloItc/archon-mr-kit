@@ -1,3 +1,15 @@
+# 0.1.1 — 2026-05-08
+
+## Fixed
+- `mr-kit-sync` (#127): when project's FROM tag doesn't exist on kit (pre-v1
+  projects or invented version strings), BASE was falling back to `kit/main`
+  which equals TARGET, producing an empty sync. Now BASE is treated as an
+  empty synthetic tree (sentinel `__EMPTY__`) so every TARGET file lands as
+  Case A "new upstream file" and gets adopted cleanly.
+- `mr-kit-sync` artifact pollution: `.archon/artifacts/runs/.../*` (transient
+  workflow scratch) was being committed into sync PRs. Now the commit step
+  resets `.archon/artifacts/` from the index before committing.
+
 # Kit Changelog
 
 All notable changes to the `archon-mr-kit` template are recorded here. The kit follows [SemVer](https://semver.org/): MAJOR.MINOR.PATCH.
