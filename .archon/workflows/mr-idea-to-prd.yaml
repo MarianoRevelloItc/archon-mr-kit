@@ -1,0 +1,441 @@
+name: mr-idea-to-prd
+description: |
+  Use when: User has a fuzzy idea for a new feature/capability and wants to turn it into a PRD
+            posted as a GitHub issue, ready for splitting into implementation tickets.
+  Triggers: "mr idea to prd", "create prd from idea", "draft a prd", "new prd",
+            "mr-idea-to-prd".
+  NOT for: Splitting an existing PRD into issues (use mr-prd-to-issues),
+           implementing an issue (use mr-issue-to-pr),
+           creating a bug report (use archon-create-issue).
+
+  Forked from archon-interactive-prd with these adaptations:
+  1. Uses the `grill-me` skill for the questioning style (one question at a time, drill into branches)
+  2. Uses the `to-prd` skill template (Problem / Solution / User Stories / Implementation Decisions / Testing / Out of Scope)
+  3. Output is BOTH a local artifact AND a GitHub issue with label `prd`
+  4. Technical phase grounded in Sales-Finder primitives (FastAPI/SQLAlchemy/Alembic + Next.js/Vitest)
+
+  Interactive workflow:
+  1. INITIATE — restate, ask foundation questions
+  2. GATE — capture foundation answers
+  3. RESEARCH — web + codebase exploration, deep dive questions
+  4. GATE — capture deep dive answers
+  5. TECHNICAL — assess feasibility against existing primitives, scope questions
+  6. GATE — capture scope answers
+  7. GENERATE — synthesize into PRD using to-prd template
+  8. VALIDATE — verify technical claims (file:line refs)
+  9. POST — create parent GitHub issue with label `prd`
+
+provider: claude
+interactive: true
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: INITIATE — Restate and ask foundation questions
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: initiate
+    model: sonnet
+    skills:
+      - grill-me
+    prompt: |
+      You are a sharp product manager starting a PRD creation process for the **Sales-Finder** project.
+      You think from first principles — start with primitives, not features.
+
+      The user wants to build: $ARGUMENTS
+
+      ## Step 1: Restate
+
+      If the input is clear, restate your understanding in 2-3 sentences and confirm:
+      "I understand you want to build: {restated understanding}. Is this correct?"
+
+      If the input is vague or empty, ask: "What do you want to build? Describe the product, feature, or capability."
+
+      ## Step 2: Ask Foundation Questions (one at a time, grill-me style)
+
+      Per the `grill-me` skill: ask ONE question at a time and provide your recommended answer for each.
+      But for this gate, batch all 5 foundation questions in a single message — the user will answer them
+      together. Subsequent gates will go one-at-a-time.
+
+      **Foundation Questions (answer all):**
+
+      1. **Who** has this problem? Be specific — what role, what context (sales team, ops, end users, internal)?
+      2. **What** problem are they facing? Describe the observable pain, not the assumed need.
+      3. **Why** can't they solve it today? What alternatives exist (manual workflow, existing Sales-Finder feature, external tool) and why do they fail?
+      4. **Why now?** What changed that makes this worth building?
+      5. **How** will you know if you solved it? What measurable outcome would success look like?
+
+      Keep it conversational. Don't generate any PRD content yet.
+
+  - id: foundation-gate
+    approval:
+      message: "Answer the foundation questions above. Your answers anchor the research phase."
+      capture_response: true
+    depends_on: [initiate]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: RESEARCH — Market + codebase exploration
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: research
+    model: sonnet
+    prompt: |
+      You are researching context for a Sales-Finder PRD. First principles —
+      what already exists before proposing anything new.
+
+      **The idea**: $ARGUMENTS
+
+      **User's foundation answers**:
+      $foundation-gate.output
+
+      ## Step 1: Web research (light)
+
+      Search briefly for: similar tools, common patterns for the domain, gotchas. Keep this short — the
+      real value is the codebase research below.
+
+      ## Step 2: Sales-Finder codebase exploration (deep)
+
+      Sales-Finder layout (verify by reading):
+      - `backend/app/` — FastAPI app, routers, models, services
+      - `backend/app/models/` — SQLAlchemy models (Company, Source, etc.)
+      - `backend/alembic/versions/` — schema migrations
+      - `backend/scripts/` — ingestion, batch jobs
+      - `frontend/app/` — Next.js routes
+      - `frontend/components/` — UI components (Kanban, CompanyCard, etc.)
+      - `frontend/lib/` — client-side helpers, API wrappers
+      - `Wiki/docs/issues/` — open issues (drafts in `_initial-drafts/`)
+
+      For each area relevant to the user's idea:
+      1. Read the actual files (don't assume)
+      2. Note exact file paths, function names, table schemas
+      3. Identify what already exists that partially solves the problem
+
+      ## Step 3: Present findings
+
+      ```
+      ## What I Found
+
+      ### Market / Prior Art
+      - {1-2 bullets, brief}
+
+      ### What Already Exists in Sales-Finder
+      - `{file:line}` — {what it does, how it relates}
+      - `{file:line}` — {what it does, how it relates}
+      - {existing endpoint / component / table that partially solves this}
+
+      ### Key Insight
+      - {The one finding that might change the approach}
+      ```
+
+      ## Step 4: Ask Deep Dive Questions
+
+      Use grill-me style — these dig into branches the user hasn't fully thought through.
+      Batch them in one message; the gate captures all answers together.
+
+      **Deep Dive Questions:**
+
+      1. **Vision**: In one sentence, what's the ideal end state if this succeeds wildly?
+      2. **Primary User**: Describe your most important user — role, context, what triggers their need.
+      3. **Job to Be Done**: Complete: "When [situation], I want to [motivation], so I can [outcome]."
+      4. **Non-Users**: Who is explicitly NOT the target? (this prevents scope creep)
+      5. **Constraints**: What limitations exist? (time, budget, technical, data freshness, infra)
+
+      Then: "Does the research change or refine your thinking? Answer the deep dive questions."
+    depends_on: [foundation-gate]
+
+  - id: deepdive-gate
+    approval:
+      message: "Answer the deep dive questions above. Add any adjustments based on the research findings."
+      capture_response: true
+    depends_on: [research]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: TECHNICAL — Feasibility against existing primitives
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: technical
+    model: sonnet
+    prompt: |
+      You are assessing technical feasibility for a Sales-Finder PRD.
+
+      **The idea**: $ARGUMENTS
+      **Foundation**: $foundation-gate.output
+      **Deep dive**: $deepdive-gate.output
+
+      ## CRITICAL: Read actual files
+
+      Every technical claim you make MUST cite a real `file:line`. Read the file before you cite it.
+
+      ## Step 1: Inventory primitives
+
+      The Sales-Finder primitives most likely involved (verify which apply):
+
+      | Layer | Primitive | Common location |
+      |-------|-----------|-----------------|
+      | DB | SQLAlchemy model | `backend/app/models/{name}.py` |
+      | DB | Alembic migration | `backend/alembic/versions/{hash}_{name}.py` |
+      | API | FastAPI router | `backend/app/api/` or `backend/app/main.py` |
+      | API | Pydantic schema | `backend/app/schemas/` |
+      | Service | Business logic | `backend/app/services/` |
+      | Ingest | Script + cron | `backend/scripts/` |
+      | UI | Next.js page | `frontend/app/{route}/page.tsx` |
+      | UI | Component | `frontend/components/{Name}.tsx` |
+      | UI | API client | `frontend/lib/api.ts` |
+      | Test | pytest backend | `backend/tests/test_*.py` |
+      | Test | vitest frontend | `frontend/**/*.test.tsx` |
+
+      For each primitive that this feature touches, READ the relevant file and note:
+      - What's already there
+      - What's the gap (if any)
+      - Whether to extend or create
+
+      ## Step 2: Smallest viable change
+
+      State the **minimum primitive surface** needed. Strongly prefer extending existing files
+      over creating new ones. Anti-pattern: creating a new endpoint when an existing one returns
+      the same data with a new param.
+
+      ## Step 3: Present technical context
+
+      ```
+      ## What Already Exists (verified)
+      - {endpoint/component/query} at `{file:line}` — {what it does}
+
+      ## Smallest Change to Solve the Problem
+      - {change 1}: {EXTEND/MODIFY/CREATE} `{file}` — {what to do}
+      - {change 2}: ...
+
+      ## Technical Context
+      - Feasibility: {HIGH/MEDIUM/LOW} — because {reason}
+      - Key risk: {main concern}
+      - Estimated phases: {rough breakdown}
+      ```
+
+      ## Step 4: Ask Scope Questions
+
+      Last gate before generation. These set the MoSCoW boundaries.
+
+      **Scope Questions:**
+
+      1. **MVP Definition**: What's the absolute minimum to test if this works (could ship this week)?
+      2. **Must-Have vs Nice-to-Have**: 2-3 items MUST be in v1. What can wait?
+      3. **Key Hypothesis**: Complete: "We believe {capability} will {solve problem} for {users}. We'll know we're right when {measurable outcome}."
+      4. **Out of Scope**: What are you explicitly NOT building (this round)?
+      5. **Open Questions**: What uncertainties could change the approach?
+    depends_on: [deepdive-gate]
+
+  - id: scope-gate
+    approval:
+      message: "Answer the scope questions above (MVP, must-haves, hypothesis, exclusions, open questions). Final input before PRD generation."
+      capture_response: true
+    depends_on: [technical]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: GENERATE — Write PRD using to-prd template
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: generate
+    model: sonnet
+    skills:
+      - to-prd
+    prompt: |
+      You are generating a Sales-Finder PRD from the user's guided answers.
+
+      **The idea**: $ARGUMENTS
+      **Foundation**: $foundation-gate.output
+      **Deep dive**: $deepdive-gate.output
+      **Scope**: $scope-gate.output
+
+      ## Step 1: Derive slug + create file
+
+      Generate a kebab-case slug from the feature name (e.g., "reachability-score", "kanban-pipeline").
+
+      ```bash
+      mkdir -p "$ARTIFACTS_DIR/prds"
+      SLUG="{kebab-case-slug}"
+      PRD_PATH="$ARTIFACTS_DIR/prds/${SLUG}.prd.md"
+      ```
+
+      ## Step 2: Re-verify file references
+
+      Before writing the Implementation Decisions section, RE-READ the actual files you cited
+      in Phase 3. If anything has drifted, correct it now.
+
+      ## Step 3: Write PRD using the to-prd template
+
+      The `to-prd` skill is preloaded. Follow its template **exactly**:
+
+      ```markdown
+      # PRD: {Feature Name}
+
+      ## Problem Statement
+
+      {The problem from the user's perspective — synthesized from foundation answers}
+
+      ## Solution
+
+      {The solution from the user's perspective — synthesized from technical and deep dive answers}
+
+      ## User Stories
+
+      An extensive numbered list, format: "As a {actor}, I want a {feature}, so that {benefit}".
+      Cover all aspects of the feature.
+
+      1. As a ..., I want ..., so that ...
+      2. As a ..., I want ..., so that ...
+      ...
+
+      ## Implementation Decisions
+
+      - **Modules to build/modify**: {list with one-line role per module — NO file paths or code snippets}
+      - **Interface changes**: {what new public APIs / endpoints / props}
+      - **Schema changes**: {DB columns, migrations needed}
+      - **Architectural decisions**: {key choices with rationale}
+      - **Specific interactions**: {key flows}
+
+      ## Testing Decisions
+
+      - **What makes a good test for this feature**: test external behavior, not implementation details
+      - **Modules that will be tested**: {list}
+      - **Prior art in the codebase**: {existing test patterns to mirror — file references OK here}
+
+      ## Out of Scope
+
+      {Bullet list — what's explicitly excluded}
+
+      ## Further Notes
+
+      {Open questions, risks, future work}
+
+      ---
+
+      ## Decisions Log (Sales-Finder addition)
+
+      | Decision | Why | When |
+      |----------|-----|------|
+      | {decision} | {rationale from one of the answers} | This conversation |
+      ```
+
+      ## Step 4: Output the file path
+
+      End your response with ONLY the file path, on its own line:
+
+      ```
+      $ARTIFACTS_DIR/prds/{slug}.prd.md
+      ```
+
+      The validator reads this.
+    depends_on: [scope-gate]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: VALIDATE — Check technical claims against codebase
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    model: sonnet
+    prompt: |
+      You are a technical validator checking a Sales-Finder PRD for accuracy.
+
+      ## Step 1: Find the PRD
+
+      ```bash
+      PRD_FILE=$(ls -t $ARTIFACTS_DIR/prds/*.prd.md | head -1)
+      echo "Validating: $PRD_FILE"
+      cat "$PRD_FILE"
+      ```
+
+      Or use the path from `$generate.output` if it's exact.
+
+      ## Step 2: Verify claims
+
+      For every cited file path, function name, schema reference, or component name in the PRD,
+      read the actual codebase and verify:
+
+      | Check | What to verify |
+      |-------|----------------|
+      | File paths | Every `backend/...` and `frontend/...` reference exists |
+      | Endpoints | If the PRD says "extend `/api/foo`", that endpoint exists. If it says "create new", confirm there's no equivalent already |
+      | DB columns | Verify against `backend/app/models/*.py` and recent alembic migrations |
+      | Components | Every `frontend/components/{Name}.tsx` reference is real |
+      | Function/type names | Match exactly |
+
+      ## Step 3: Edit PRD with corrections
+
+      If you find drift:
+      1. Edit the PRD file directly to correct
+      2. Add a `## Validation Notes` section at the bottom listing what was corrected
+
+      If everything checks out, append:
+      ```
+      ## Validation Notes
+
+      All technical references verified against the codebase. No corrections needed.
+      ```
+
+      ## Step 4: Summary output
+
+      ```
+      ## PRD Validated
+
+      **File**: `{prd-path}`
+      **Checks**: {N} file paths, {N} endpoints, {N} DB references, {N} components
+      **Corrections**: {count}
+      {list corrections if any}
+      ```
+    depends_on: [generate]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: POST — Create parent GitHub issue
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: post-to-github
+    prompt: |
+      Post the validated PRD as a GitHub issue with the `prd` label.
+
+      ## Step 1: Find PRD
+
+      ```bash
+      PRD_FILE=$(ls -t $ARTIFACTS_DIR/prds/*.prd.md | head -1)
+      PRD_TITLE=$(head -1 "$PRD_FILE" | sed 's/^# //')
+      ```
+
+      ## Step 2: Ensure label exists
+
+      ```bash
+      gh label list --limit 200 | grep -q '^prd' || \
+        gh label create prd --color "0366D6" --description "Product Requirements Document"
+      ```
+
+      ## Step 3: Create the issue
+
+      ```bash
+      gh issue create \
+        --title "$PRD_TITLE" \
+        --label "prd" \
+        --body-file "$PRD_FILE"
+      ```
+
+      Capture the issue number for the report:
+      ```bash
+      ISSUE_NUM=$(gh issue list --label prd --state open --limit 1 --json number --jq '.[0].number')
+      ISSUE_URL=$(gh issue list --label prd --state open --limit 1 --json url --jq '.[0].url')
+      echo "$ISSUE_NUM" > "$ARTIFACTS_DIR/.prd-issue-number"
+      echo "$ISSUE_URL" > "$ARTIFACTS_DIR/.prd-issue-url"
+      ```
+
+      ## Step 4: Final summary
+
+      ```markdown
+      ## PRD Created
+
+      **Title**: {title}
+      **GitHub Issue**: #{number} — {url}
+      **Local artifact**: `{prd-path}`
+
+      ### Next Steps
+
+      1. Review the issue on GitHub.
+      2. To split into implementation issues: run `mr-prd-to-issues` with the issue number above.
+      3. To implement an individual issue: run `mr-issue-to-pr` with that issue number.
+      ```
+    depends_on: [validate]

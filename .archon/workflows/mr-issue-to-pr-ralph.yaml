@@ -1,0 +1,380 @@
+name: mr-issue-to-pr-ralph
+description: |
+  Use when: User wants AFK-friendly issue-to-merged variant of mr-issue-to-pr.
+            Ralph-mode: rebase-defensive + auto-merge when safe.
+  Triggers: "ralph", "mr ralph", "afk fix", "mr-issue-to-pr-ralph",
+            "ship issue afk", "auto merge issue".
+  NOT for: Full manual control over the merge (use mr-issue-to-pr instead),
+           PRD creation (use mr-idea-to-prd), splitting (use mr-prd-to-issues).
+
+  Same DAG as mr-issue-to-pr with 2 added safety/automation nodes:
+  1. rebase-against-main BEFORE create-pr (defense for parallel/staggered runs)
+  2. auto-merge-or-defer AFTER report (auto-merges if safe, else labels needs-human-review)
+
+  Auto-merge policy (BALANCED):
+    Mergea si:    validate verde + 0 CRITICAL pendientes + rebase OK
+    Defiere si:   hay CRITICAL pendientes, validate falló, o rebase con conflict
+
+  Use cases:
+  - SOLO 1 issue:    archon workflow run mr-issue-to-pr-ralph --branch fix/issue-N "Fix #N"
+  - BATCH SECUENCIAL: for n in 2 4 5; do archon workflow run mr-issue-to-pr-ralph --branch fix/issue-$n "Fix #$n"; done
+  - BATCH PARALELO:   for n in ...; do nohup env -u CLAUDECODE archon workflow run mr-issue-to-pr-ralph --branch fix/issue-$n "Fix #$n" & disown $!; done
+  - PLANNED WAVES:    use mr-plan-waves first, it generates a script that uses this workflow
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASES 1-5: same as mr-issue-to-pr (FETCH, CLASSIFY, RESEARCH,
+  #             INVESTIGATE/PLAN, BRIDGE, IMPLEMENT, VALIDATE)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#7", "issue 7", "7"), extract that number.
+      - If the message is ambiguous, use `gh issue list` to search and pick the best match.
+
+      CRITICAL: Output must be ONLY the bare number, no quotes, no markdown. Example: 7
+    model: haiku
+    allowed_tools: [Bash]
+
+  - id: fetch-issue
+    bash: |
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "Failed to extract issue number" >&2; exit 1
+      fi
+      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+    depends_on: [extract-issue-number]
+    timeout: 30000
+
+  - id: classify
+    prompt: |
+      You are an issue classifier. Analyze the GitHub issue below.
+
+      ## Issue Content
+      $fetch-issue.output
+
+      ## Classification Rules
+      | Type | Indicators |
+      |------|------------|
+      | bug | "broken", "error", "crash", stack traces, regression |
+      | feature | "add", "new", "support", net-new capability |
+      | enhancement | "improve", "better", "extend", incremental improvement |
+      | refactor | "clean up", "simplify", "reorganize" |
+      | chore | "update deps", "upgrade", "maintenance" |
+      | documentation | "docs", "readme", "clarify" |
+    depends_on: [fetch-issue]
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  - id: web-research
+    command: archon-web-research
+    depends_on: [classify]
+    context: fresh
+
+  - id: investigate
+    command: archon-investigate-issue
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+
+  - id: plan
+    command: archon-create-plan
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "Bridged plan.md → investigation.md"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md exists"
+      else
+        echo "WARNING: No investigation.md or plan.md" >&2; exit 1
+      fi
+    depends_on: [investigate, plan]
+    trigger_rule: one_success
+
+  - id: implement
+    command: mr-tdd-implement
+    depends_on: [bridge-artifacts]
+    context: fresh
+    model: claude-opus-4-6[1m]
+    skills:
+      - tdd
+    idle_timeout: 1200000
+
+  - id: validate
+    command: mr-multi-validate
+    depends_on: [implement]
+    context: fresh
+    idle_timeout: 600000
+
+  # ═══════════════════════════════════════════════════════════════
+  # NUEVO #1: REBASE-AGAINST-MAIN (defensa para parallel/staggered runs)
+  # Si main avanzó mientras corríamos (otro hijo mergeó), rebase los
+  # commits de TDD-implement contra el main actual.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: rebase-against-main
+    bash: |
+      set -e
+      echo "[rebase] Fetching origin/$BASE_BRANCH..."
+      git fetch origin "$BASE_BRANCH" 2>&1 | tail -3
+
+      CURRENT_BRANCH=$(git branch --show-current)
+      BEHIND=$(git rev-list --count "HEAD..origin/$BASE_BRANCH" 2>/dev/null || echo "0")
+      echo "[rebase] Branch '$CURRENT_BRANCH' is $BEHIND commits behind origin/$BASE_BRANCH"
+
+      if [ "$BEHIND" = "0" ]; then
+        echo "[rebase] Already up to date — skipping rebase"
+        echo "REBASE_OK" > "$ARTIFACTS_DIR/.rebase-status"
+      else
+        echo "[rebase] Attempting rebase against origin/$BASE_BRANCH..."
+        if git rebase "origin/$BASE_BRANCH"; then
+          echo "[rebase] ✓ REBASE_OK"
+          echo "REBASE_OK" > "$ARTIFACTS_DIR/.rebase-status"
+        else
+          echo "[rebase] ✗ CONFLICT detected — aborting rebase"
+          git rebase --abort
+          echo "REBASE_CONFLICT" > "$ARTIFACTS_DIR/.rebase-status"
+          # No exit 1 — seguimos creando el PR igual, y el auto-merge step verá
+          # el rebase-status y NO mergeará (deja en needs-human-review)
+        fi
+      fi
+    depends_on: [validate]
+    timeout: 120000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: CREATE DRAFT PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      Create a draft pull request for the current branch.
+
+      ## Context
+      - **Issue**: $ARGUMENTS
+      - **Classification**: $classify.output
+      - **Issue title**: $classify.output.title
+
+      ## Instructions
+      1. Check git status — ensure all changes are committed
+      2. Push the branch: `git push -u origin HEAD` (or `--force-with-lease` if rebase happened)
+      3. Read implementation artifacts from `$ARTIFACTS_DIR/`:
+         - `investigation.md` or `plan.md`
+         - `implementation.md` (TDD coverage table)
+         - `validation.md` (gate results)
+         - `.rebase-status` (REBASE_OK or REBASE_CONFLICT)
+      4. Check if PR already exists: `gh pr list --head $(git branch --show-current)`
+      5. Look for PR template at `.github/pull_request_template.md` or similar.
+      6. Create DRAFT PR: `gh pr create --draft --base $BASE_BRANCH`
+         - Title: concise from `$classify.output.title`
+         - Body: fill template with artifacts. Include `Fixes #...`.
+         - If rebase had conflict, add label `needs-human-review` and note "rebase conflict — manual resolution needed" in body
+      7. Capture identifiers:
+         ```bash
+         PR_NUMBER=$(gh pr view --json number -q '.number')
+         echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+         PR_URL=$(gh pr view --json url -q '.url')
+         echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
+         ```
+    depends_on: [rebase-against-main]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7-9: REVIEW SCOPE + 5 AGENTS + SYNTHESIZE + SELF-FIX
+  # (same as mr-issue-to-pr)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [create-pr]
+    context: fresh
+
+  - id: review-classify
+    prompt: |
+      You are a PR review classifier. Analyze the PR scope and determine
+      which review agents should run.
+
+      ## PR Scope
+      $review-scope.output
+
+      ## Rules
+      - **Code review**: ALWAYS run.
+      - **Error handling**: Run if diff has try/catch, async/await, error handling.
+      - **Test coverage**: Run if diff touches source code.
+      - **Comment quality**: Run if diff modifies comments/docstrings.
+      - **Docs impact**: Run if diff adds/removes/renames public APIs/CLI flags/env vars.
+    depends_on: [review-scope]
+    model: haiku
+    allowed_tools: []
+    context: fresh
+    output_format:
+      type: object
+      properties:
+        run_code_review: { type: string, enum: ["true", "false"] }
+        run_error_handling: { type: string, enum: ["true", "false"] }
+        run_test_coverage: { type: string, enum: ["true", "false"] }
+        run_comment_quality: { type: string, enum: ["true", "false"] }
+        run_docs_impact: { type: string, enum: ["true", "false"] }
+        reasoning: { type: string }
+      required:
+        - run_code_review
+        - run_error_handling
+        - run_test_coverage
+        - run_comment_quality
+        - run_docs_impact
+        - reasoning
+
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [review-classify]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_error_handling == 'true'"
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_test_coverage == 'true'"
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_comment_quality == 'true'"
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_docs_impact == 'true'"
+    context: fresh
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    context: fresh
+
+  - id: self-fix
+    command: archon-implement-review-fixes
+    depends_on: [synthesize]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 10: PROMOTE FOLLOW-UPS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: promote-followups
+    command: mr-promote-followups
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 11: REPORT TO ISSUE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    command: archon-issue-completion-report
+    depends_on: [promote-followups]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # NUEVO #2: AUTO-MERGE-OR-DEFER (ralph-only, política BALANCED)
+  # Si validate verde + 0 CRITICAL pendientes + rebase OK → merge
+  # Si no → label needs-human-review + comment explicativo
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: auto-merge-or-defer
+    bash: |
+      set -e
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null | tr -d ' \n')
+      if [ -z "$PR_NUMBER" ]; then
+        echo "[auto-merge] ERROR: no PR number in artifacts" >&2; exit 1
+      fi
+      echo "[auto-merge] Evaluating PR #$PR_NUMBER for auto-merge eligibility"
+
+      # Gate 1: rebase status (from rebase-against-main step)
+      REBASE_STATUS=$(cat "$ARTIFACTS_DIR/.rebase-status" 2>/dev/null || echo "UNKNOWN")
+      echo "[auto-merge] Gate 1 (rebase): $REBASE_STATUS"
+
+      # Gate 2: validate status (from mr-multi-validate)
+      # We trust that if we got here, validate passed (otherwise the workflow would have stopped)
+      VALIDATE_STATUS="ALL_PASS"
+      if [ -f "$ARTIFACTS_DIR/validation.md" ]; then
+        if grep -q "FAIL" "$ARTIFACTS_DIR/validation.md"; then
+          VALIDATE_STATUS="FAIL"
+        fi
+      fi
+      echo "[auto-merge] Gate 2 (validate): $VALIDATE_STATUS"
+
+      # Gate 3: CRITICAL findings still pending (from consolidated-review minus fix-report)
+      CRITICAL_TOTAL=0
+      CRITICAL_FIXED=0
+      if [ -f "$ARTIFACTS_DIR/review/consolidated-review.md" ]; then
+        # Extract count from "🔴 CRITICAL | N" line
+        CRITICAL_TOTAL=$(grep -oE '🔴 CRITICAL \| [0-9]+' "$ARTIFACTS_DIR/review/consolidated-review.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+        CRITICAL_TOTAL=${CRITICAL_TOTAL:-0}
+      fi
+      if [ -f "$ARTIFACTS_DIR/review/fix-report.md" ]; then
+        # Extract from "🔴 CRITICAL | N | 0" pattern (Fixed | Skipped)
+        CRITICAL_FIXED=$(grep -oE '🔴 CRITICAL \| [0-9]+' "$ARTIFACTS_DIR/review/fix-report.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+        CRITICAL_FIXED=${CRITICAL_FIXED:-0}
+      fi
+      CRITICAL_PENDING=$((CRITICAL_TOTAL - CRITICAL_FIXED))
+      echo "[auto-merge] Gate 3 (CRITICAL pending): $CRITICAL_PENDING ($CRITICAL_TOTAL total - $CRITICAL_FIXED fixed)"
+
+      # ─── Decision ───
+      if [ "$REBASE_STATUS" = "REBASE_OK" ] && [ "$VALIDATE_STATUS" = "ALL_PASS" ] && [ "$CRITICAL_PENDING" -eq 0 ]; then
+        echo "[auto-merge] ✓ All 3 gates passed — proceeding to merge"
+        gh pr ready "$PR_NUMBER" 2>&1 | tail -2
+        if gh pr merge "$PR_NUMBER" --squash --delete-branch 2>&1; then
+          echo "AUTO_MERGED" > "$ARTIFACTS_DIR/.merge-status"
+          echo "[auto-merge] ✓ PR #$PR_NUMBER MERGED"
+          gh pr comment "$PR_NUMBER" --body "🤖 Auto-merged by mr-issue-to-pr-ralph: validate verde + 0 CRITICAL pending + rebase OK." 2>&1 | tail -1 || true
+        else
+          echo "[auto-merge] ✗ Merge command failed (likely race condition); marking needs-human-review"
+          echo "MERGE_FAILED" > "$ARTIFACTS_DIR/.merge-status"
+          gh pr edit "$PR_NUMBER" --add-label "needs-human-review" 2>&1 | tail -1 || true
+        fi
+      else
+        echo "[auto-merge] ✗ Threshold not met — deferring to human"
+        echo "DEFERRED_TO_HUMAN" > "$ARTIFACTS_DIR/.merge-status"
+        # Make sure label exists
+        gh label list --limit 200 | grep -q '^needs-human-review' || \
+          gh label create needs-human-review --color "FBCA04" --description "Auto-merge skipped — requires human review" 2>&1 | tail -1 || true
+        gh pr edit "$PR_NUMBER" --add-label "needs-human-review" 2>&1 | tail -1 || true
+        REASON=""
+        [ "$REBASE_STATUS" != "REBASE_OK" ] && REASON="$REASON\n- Rebase status: $REBASE_STATUS (conflict needs manual resolution)"
+        [ "$VALIDATE_STATUS" != "ALL_PASS" ] && REASON="$REASON\n- Validate status: $VALIDATE_STATUS"
+        [ "$CRITICAL_PENDING" -gt 0 ] && REASON="$REASON\n- CRITICAL pending: $CRITICAL_PENDING (auto-fix did not resolve all)"
+        gh pr comment "$PR_NUMBER" --body "$(printf '🚦 Auto-merge skipped — needs human review.\n\nReasons:%b\n\nReview, fix manually, then mergea con `gh pr merge %d --squash --delete-branch`.' "$REASON" "$PR_NUMBER")" 2>&1 | tail -1 || true
+      fi
+    depends_on: [report]
+    timeout: 120000

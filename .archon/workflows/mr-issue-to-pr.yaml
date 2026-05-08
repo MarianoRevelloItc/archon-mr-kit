@@ -1,0 +1,328 @@
+name: mr-issue-to-pr
+description: |
+  Use when: User wants to take a GitHub issue and produce a review-ready PR using strict TDD,
+            multi-layer validation, and auto-promoted follow-ups.
+  Triggers: "mr issue to pr", "implement issue with tdd", "ship issue", "issue to pr",
+            "mr-issue-to-pr".
+  NOT for: Comprehensive multi-agent reviews of an existing PR (use archon-comprehensive-pr-review),
+           PRD creation (use mr-idea-to-prd), splitting a PRD into issues (use mr-prd-to-issues),
+           bug reproduction (use archon-create-issue).
+
+  Forked from archon-fix-github-issue with 3 surgical changes:
+  1. mr-tdd-implement replaces archon-fix-issue (strict red→green per behavior)
+  2. mr-multi-validate replaces archon-validate (CODE/HTTP/DOM/STACK gates)
+  3. mr-promote-followups added before report (MEDIUM/LOW → auto-followup issues)
+  4. archon-simplify-changes is dropped (it caused scope creep in the pilot)
+
+  Full DAG:
+  1. extract-issue (haiku) → fetch-issue (gh) → classify (haiku, structured)
+  2. web-research (parallel) + investigate (bug) | plan (feature)
+  3. bridge-artifacts → mr-tdd-implement (opus) → mr-multi-validate
+  4. create-pr (draft, fills PR template)
+  5. review-scope → review-classify (haiku) → 5 conditional review agents (parallel)
+  6. synthesize-review → archon-implement-review-fixes (CRITICAL/HIGH only)
+  7. mr-promote-followups (MEDIUM/LOW → issues) → issue-completion-report
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH & CLASSIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#7", "issue 7", "7"), extract that number.
+      - If the message is ambiguous (e.g., "fix the reachability score bug"), use `gh issue list` to search and pick the best match.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example correct output: 7
+    model: haiku
+    allowed_tools: [Bash]
+
+  - id: fetch-issue
+    bash: |
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "Failed to extract issue number from: $extract-issue-number.output" >&2
+        exit 1
+      fi
+      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+    depends_on: [extract-issue-number]
+    timeout: 30000
+
+  - id: classify
+    prompt: |
+      You are an issue classifier. Analyze the GitHub issue below and determine its type.
+
+      ## Issue Content
+
+      $fetch-issue.output
+
+      ## Classification Rules
+
+      | Type | Indicators |
+      |------|------------|
+      | bug | "broken", "error", "crash", "doesn't work", stack traces, regression |
+      | feature | "add", "new", "support", "would be nice", net-new capability |
+      | enhancement | "improve", "better", "update existing", "extend", incremental improvement |
+      | refactor | "clean up", "simplify", "reorganize", "restructure" |
+      | chore | "update deps", "upgrade", "maintenance", "CI/CD" |
+      | documentation | "docs", "readme", "clarify", "examples" |
+
+      Provide reasoning for your classification.
+    depends_on: [fetch-issue]
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: RESEARCH (parallel with investigate/plan)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: web-research
+    command: archon-web-research
+    depends_on: [classify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: INVESTIGATE (bugs) / PLAN (features)
+  # Reused from Archon defaults. They write investigation.md or plan.md.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    command: archon-investigate-issue
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+
+  - id: plan
+    command: archon-create-plan
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+
+  # Bridge: ensure investigation.md exists for the implement step
+  # (mr-tdd-implement reads investigation.md OR plan.md; this normalizes for legacy commands)
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "Bridged plan.md → investigation.md for downstream steps"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md exists from investigate step"
+      else
+        echo "WARNING: No investigation.md or plan.md found — implement may fail"
+        exit 1
+      fi
+    depends_on: [investigate, plan]
+    trigger_rule: one_success
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: TDD IMPLEMENT (custom — replaces archon-fix-issue)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    command: mr-tdd-implement
+    depends_on: [bridge-artifacts]
+    context: fresh
+    model: claude-opus-4-6[1m]
+    skills:
+      - tdd
+    idle_timeout: 1200000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: MULTI-LAYER VALIDATE (custom — replaces archon-validate)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: mr-multi-validate
+    depends_on: [implement]
+    context: fresh
+    idle_timeout: 600000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: CREATE DRAFT PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      Create a draft pull request for the current branch.
+
+      ## Context
+
+      - **Issue**: $ARGUMENTS
+      - **Classification**: $classify.output
+      - **Issue title**: $classify.output.title
+
+      ## Instructions
+
+      1. Check git status — ensure all changes are committed. The mr-tdd-implement step should have committed everything per AC.
+         If uncommitted changes exist, stage and commit them with a clear message.
+      2. Push the branch: `git push -u origin HEAD`
+      3. Read implementation artifacts from `$ARTIFACTS_DIR/` for PR body context:
+         - `$ARTIFACTS_DIR/investigation.md` or `$ARTIFACTS_DIR/plan.md`
+         - `$ARTIFACTS_DIR/implementation.md` (TDD coverage table — paste this verbatim into the PR body if a section fits)
+         - `$ARTIFACTS_DIR/validation.md` (gate results — paste verbatim)
+      4. Check if a PR already exists for this branch: `gh pr list --head $(git branch --show-current)`
+         - If PR exists, skip creation and capture its number
+      5. Look for the project's PR template at `.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, or `docs/PULL_REQUEST_TEMPLATE.md`. Read whichever one exists.
+      6. Create a DRAFT PR: `gh pr create --draft --base $BASE_BRANCH`
+         - Title: concise, imperative mood, under 70 chars (use the issue title from `$classify.output.title`)
+         - Body: if a PR template was found, fill in **every section** from the artifacts. Don't skip sections or leave placeholders.
+                 If no template, write a body with summary, AC coverage table, gate results, and `Fixes #...`.
+         - Link to issue: include `Fixes #...` or `Closes #...`
+      7. Capture PR identifiers:
+         ```bash
+         PR_NUMBER=$(gh pr view --json number -q '.number')
+         echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+         PR_URL=$(gh pr view --json url -q '.url')
+         echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
+         ```
+    depends_on: [validate]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7: REVIEW SCOPE + CLASSIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [create-pr]
+    context: fresh
+
+  - id: review-classify
+    prompt: |
+      You are a PR review classifier. Analyze the PR scope and determine
+      which review agents should run.
+
+      ## PR Scope
+
+      $review-scope.output
+
+      ## Rules
+
+      - **Code review**: ALWAYS run. This is mandatory for every PR. It also checks
+        the PR against CLAUDE.md rules and project conventions.
+      - **Error handling**: Run if the diff touches code with try/catch, error handling,
+        async/await, or adds new failure paths.
+      - **Test coverage**: Run if the diff touches source code (not just tests, docs, or config).
+      - **Comment quality**: Run if the diff adds or modifies comments, docstrings, JSDoc,
+        or significant documentation within code files.
+      - **Docs impact**: Run if the diff adds/removes/renames public APIs, commands, CLI flags,
+        environment variables, or user-facing features.
+
+      Provide your reasoning for each decision.
+    depends_on: [review-scope]
+    model: haiku
+    allowed_tools: []
+    context: fresh
+    output_format:
+      type: object
+      properties:
+        run_code_review:
+          type: string
+          enum: ["true", "false"]
+        run_error_handling:
+          type: string
+          enum: ["true", "false"]
+        run_test_coverage:
+          type: string
+          enum: ["true", "false"]
+        run_comment_quality:
+          type: string
+          enum: ["true", "false"]
+        run_docs_impact:
+          type: string
+          enum: ["true", "false"]
+        reasoning:
+          type: string
+      required:
+        - run_code_review
+        - run_error_handling
+        - run_test_coverage
+        - run_comment_quality
+        - run_docs_impact
+        - reasoning
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 8: 5 PARALLEL REVIEW AGENTS (conditional)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [review-classify]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_error_handling == 'true'"
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_test_coverage == 'true'"
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_comment_quality == 'true'"
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_docs_impact == 'true'"
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 9: SYNTHESIZE + AUTO-FIX (CRITICAL/HIGH only)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    context: fresh
+
+  - id: self-fix
+    command: archon-implement-review-fixes
+    depends_on: [synthesize]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 10: PROMOTE FOLLOW-UPS (custom — MEDIUM/LOW → issues)
+  # Replaces archon-simplify-changes which caused scope creep
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: promote-followups
+    command: mr-promote-followups
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 11: FINAL REPORT TO ISSUE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    command: archon-issue-completion-report
+    depends_on: [promote-followups]
+    context: fresh

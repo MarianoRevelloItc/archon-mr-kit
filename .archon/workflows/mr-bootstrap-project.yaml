@@ -1,0 +1,353 @@
+name: mr-bootstrap-project
+description: |
+  Use when: User wants to bootstrap a NEW repository so the mr-* workflow kit can run on it.
+  Triggers: "mr bootstrap", "bootstrap project", "set up archon for this repo",
+            "init mr workflows", "mr-bootstrap-project".
+  NOT for: Repos that already have `.archon/` (use mr-idea-to-prd to start work),
+           one-off scaffolding (this workflow is opinionated for the mr-* kit).
+
+  Sets up:
+  1. `.archon/` directory structure with config.yaml
+  2. CLAUDE.md (template, asks user to confirm)
+  3. .gitignore additions (ignore `.archon/mcp/` only)
+  4. Baseline GitHub labels: prd, auto-followup, HITL, AFK, needs-human-review
+  5. (Optional) GitHub PR template
+  6. Verifies `gh` is authenticated and `archon` CLI works
+
+  Idempotent: re-running on a repo that's partially set up only adds what's missing.
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: PRECHECK — Required tools and git state
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: precheck
+    bash: |
+      set -e
+
+      echo "=== Tool checks ==="
+      command -v git >/dev/null && echo "git: OK" || { echo "git: MISSING"; exit 1; }
+      command -v gh  >/dev/null && echo "gh: OK"  || { echo "gh: MISSING (install from https://cli.github.com)"; exit 1; }
+      command -v archon >/dev/null && echo "archon: OK" || { echo "archon: MISSING (install per .claude/skills/archon/guides/setup.md)"; exit 1; }
+
+      echo ""
+      echo "=== Git state ==="
+      git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "ERROR: not inside a git repo"; exit 1; }
+      echo "GIT_ROOT=$(git rev-parse --show-toplevel)"
+      echo "BRANCH=$(git branch --show-current 2>/dev/null || echo '(detached)')"
+
+      echo ""
+      echo "=== gh auth ==="
+      gh auth status 2>&1 | head -5 || { echo "ERROR: gh not authenticated. Run: gh auth login"; exit 1; }
+
+      echo ""
+      echo "=== Existing .archon/ state ==="
+      [ -d .archon/workflows ] && echo "HAS_WORKFLOWS_DIR=true" || echo "HAS_WORKFLOWS_DIR=false"
+      [ -d .archon/commands ]  && echo "HAS_COMMANDS_DIR=true"  || echo "HAS_COMMANDS_DIR=false"
+      [ -f .archon/config.yaml ] && echo "HAS_CONFIG=true" || echo "HAS_CONFIG=false"
+      [ -f CLAUDE.md ] && echo "HAS_CLAUDE_MD=true" || echo "HAS_CLAUDE_MD=false"
+
+      echo ""
+      echo "PRECHECK_OK"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: SCAFFOLD — Create directories and config
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: scaffold-archon
+    bash: |
+      set -e
+      mkdir -p .archon/workflows .archon/commands
+
+      if [ ! -f .archon/config.yaml ]; then
+        cat > .archon/config.yaml <<'EOF'
+      assistant: claude
+
+      worktree:
+        baseBranch: main
+        copyFiles:
+          - .env
+
+      defaults:
+        loadDefaultCommands: true
+        loadDefaultWorkflows: true
+      EOF
+        echo "Created: .archon/config.yaml"
+      else
+        echo "Skipped: .archon/config.yaml already exists"
+      fi
+
+      ls -la .archon/
+    depends_on: [precheck]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: GITIGNORE — Only ignore .archon/mcp/, NOT workflows/commands
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: update-gitignore
+    bash: |
+      set -e
+      if [ ! -f .gitignore ]; then
+        touch .gitignore
+      fi
+
+      # If the user has the entire `.archon/` ignored, fix it (workflows/commands must be committed)
+      if grep -qE '^\.archon/?$' .gitignore; then
+        # Remove the bad line, add the correct one
+        sed -i.bak -E '/^\.archon\/?$/d' .gitignore && rm -f .gitignore.bak
+        echo "Removed overly-broad .archon/ ignore rule"
+      fi
+
+      if ! grep -q '^\.archon/mcp/' .gitignore; then
+        printf '\n# Archon — workflows/ and commands/ are committed; only ignore mcp/ (env vars)\n.archon/mcp/\n' >> .gitignore
+        echo "Added: .archon/mcp/ to .gitignore"
+      else
+        echo "Skipped: .archon/mcp/ already in .gitignore"
+      fi
+
+      grep -E '\.archon' .gitignore || true
+    depends_on: [scaffold-archon]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: CLAUDE.md — Render template if missing
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: render-claude-md
+    prompt: |
+      Render a CLAUDE.md for this repo if one doesn't exist.
+
+      ## Step 1: Check
+
+      ```bash
+      [ -f CLAUDE.md ] && echo "EXISTS" || echo "MISSING"
+      ```
+
+      If `EXISTS`, output: `Skipped CLAUDE.md — already present.` and stop.
+
+      ## Step 2: Discover the stack
+
+      Identify the project's stack so the CLAUDE.md is accurate. Check for:
+      - `package.json` (Node), `pyproject.toml` (Python), `Cargo.toml` (Rust), `go.mod` (Go)
+      - Test runners: vitest, jest, pytest, cargo test, go test
+      - Linters: eslint, ruff, golangci-lint
+      - DB / migrations: alembic, prisma, knex, drizzle
+      - Frameworks: Next.js, FastAPI, Express, Django
+
+      ## Step 3: Write CLAUDE.md
+
+      Use this skeleton (fill in with real values from step 2):
+
+      ```markdown
+      # CLAUDE.md
+
+      Project conventions and rules for AI agents working on this repo.
+
+      ## Stack
+
+      - **Backend**: {language + framework + version}
+      - **Frontend**: {framework + version}
+      - **Database**: {engine + migration tool}
+      - **Container**: {docker compose | kubernetes | none}
+
+      ## Layout
+
+      - `{backend dir}/` — {role}
+      - `{frontend dir}/` — {role}
+      - `{tests dir(s)}/` — {role}
+      - `{docs dir}/` — {role}
+
+      ## Commands
+
+      | Command | What it does |
+      |---------|--------------|
+      | `{install cmd}` | Install dependencies |
+      | `{test cmd}` | Run tests |
+      | `{lint cmd}` | Run linter |
+      | `{type-check cmd}` | Type-check |
+      | `{format cmd}` | Format code |
+
+      ## Conventions
+
+      - **Test style**: {behavior tests through public APIs, not implementation; mirror existing patterns in `{path}`}
+      - **Error handling**: {pattern from existing code with file:line ref}
+      - **Logging**: {pattern + file:line ref}
+      - **Naming**: {snake_case / camelCase / file naming patterns}
+
+      ## TDD
+
+      This repo uses strict TDD via the `tdd` skill. One behavior per RED → GREEN cycle. No code without a failing test.
+
+      ## Workflows
+
+      The `.archon/workflows/` directory contains the mr-* workflow kit:
+      - `mr-idea-to-prd` — fuzzy idea → PRD GitHub issue
+      - `mr-prd-to-issues` — PRD → child implementation issues
+      - `mr-issue-to-pr` — issue → review-ready PR with TDD
+      - `mr-bootstrap-project` — (this workflow) bootstrap a new repo
+
+      Run with: `archon workflow run mr-{name} --branch {branch} "{message}"`
+      ```
+
+      ## Step 4: Output
+
+      ```
+      ## CLAUDE.md
+      - Status: {CREATED | EXISTS}
+      - Path: CLAUDE.md
+      ```
+    depends_on: [scaffold-archon]
+    allowed_tools: [Read, Write, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: LABELS — Create baseline GitHub labels
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-labels
+    bash: |
+      set -e
+      # Each line: name|color|description
+      LABELS=(
+        "prd|0366D6|Product Requirements Document"
+        "auto-followup|FBCA04|Auto-promoted from PR review (MEDIUM/LOW finding)"
+        "HITL|D93F0B|Human-in-the-loop required (design call needed)"
+        "AFK|0E8A16|Can be implemented autonomously"
+        "needs-human-review|B60205|Ralph deferred auto-merge — requires manual review before merge"
+      )
+
+      for entry in "${LABELS[@]}"; do
+        name="${entry%%|*}"
+        rest="${entry#*|}"
+        color="${rest%%|*}"
+        desc="${rest#*|}"
+        if gh label list --limit 200 | grep -q "^${name}\b"; then
+          echo "Skipped: label '${name}' already exists"
+        else
+          gh label create "$name" --color "$color" --description "$desc" && echo "Created: ${name}"
+        fi
+      done
+    depends_on: [precheck]
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: PR TEMPLATE — Create one if missing
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: pr-template
+    bash: |
+      set -e
+      mkdir -p .github
+
+      TEMPLATE=".github/pull_request_template.md"
+      if [ -f "$TEMPLATE" ] || [ -f ".github/PULL_REQUEST_TEMPLATE.md" ]; then
+        echo "Skipped: PR template already exists"
+      else
+        cat > "$TEMPLATE" <<'EOF'
+      ## Summary
+
+      <!-- 1-3 bullets: what changes and why -->
+
+      ## AC Coverage
+
+      <!-- For each acceptance criterion from the issue, list the test(s) covering it.
+           If implemented via mr-tdd-implement, paste the coverage table from
+           $ARTIFACTS_DIR/implementation.md here. -->
+
+      | # | AC | Tests | Status |
+      |---|----|-------|--------|
+      | 1 | ... | ... | ✅ |
+
+      ## Validation
+
+      <!-- If implemented via mr-multi-validate, paste the gates table here. -->
+
+      | Gate | Status | Details |
+      |------|--------|---------|
+      | CODE | ✅/❌ | ... |
+      | HTTP | ✅/❌ | ... |
+      | DOM | ✅/❌ | ... |
+      | STACK | ✅/❌ | ... |
+
+      ## Test Plan
+
+      - [ ] {manual verification step 1}
+      - [ ] {manual verification step 2}
+
+      ## Linked
+
+      Fixes #
+      EOF
+        echo "Created: $TEMPLATE"
+      fi
+    depends_on: [scaffold-archon]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7: VERIFY — Confirm archon sees the kit
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: verify
+    bash: |
+      set -e
+      echo "=== .archon/ tree ==="
+      find .archon -maxdepth 2 -type f 2>/dev/null
+
+      echo ""
+      echo "=== archon workflow list (mr-* only) ==="
+      archon workflow list 2>&1 | grep -E '^\s*mr-' || echo "(none — copy mr-* workflows into .archon/workflows/)"
+
+      echo ""
+      echo "=== Final labels ==="
+      gh label list --limit 200 | grep -E "^(prd|auto-followup|HITL|AFK|needs-human-review)\b" || true
+
+      echo ""
+      echo "BOOTSTRAP_OK"
+    depends_on: [render-claude-md, update-gitignore, create-labels, pr-template]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 8: REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    prompt: |
+      Bootstrap complete. Output a final summary for the user.
+
+      ```bash
+      cat .archon/config.yaml
+      ls .archon/workflows/ 2>/dev/null
+      ls .archon/commands/ 2>/dev/null
+      ```
+
+      Then output:
+
+      ```markdown
+      ## Bootstrap Complete
+
+      ### Created
+      - `.archon/` (workflows/, commands/, config.yaml)
+      - `CLAUDE.md` ({CREATED|EXISTS})
+      - `.gitignore` updated (only `.archon/mcp/` ignored)
+      - GitHub labels: `prd`, `auto-followup`, `HITL`, `AFK`, `needs-human-review`
+      - `.github/pull_request_template.md` ({CREATED|EXISTS})
+
+      ### Workflows installed
+      {list of mr-* yaml files in .archon/workflows/, or "(none yet — drop in the mr-* kit)"}
+
+      ### Next Steps
+
+      1. Drop the mr-* workflow files into `.archon/workflows/` if not already present:
+         - `mr-idea-to-prd.yaml`
+         - `mr-prd-to-issues.yaml`
+         - `mr-issue-to-pr.yaml`
+      4. (Optional) For batch processing N issues in parallel, use the documented
+         `nohup` pattern in MANUAL.md — there's no batch workflow YAML; the
+         spawn-detached bash pattern is more robust than nesting workflows.
+      2. Drop the mr-* command files into `.archon/commands/`:
+         - `mr-tdd-implement.md`
+         - `mr-multi-validate.md`
+         - `mr-promote-followups.md`
+      3. Run `archon validate workflows mr-issue-to-pr` to confirm everything wires up.
+      4. Start your first PRD: `archon workflow run mr-idea-to-prd --branch prd/{name} "{idea}"`
+      ```
+    depends_on: [verify]

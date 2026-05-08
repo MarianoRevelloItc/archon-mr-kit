@@ -1,0 +1,340 @@
+name: mr-prd-to-issues
+description: |
+  Use when: User has a PRD GitHub issue and wants to break it into implementable child issues
+            using vertical slice (tracer-bullet) decomposition.
+  Triggers: "mr prd to issues", "split prd", "break prd into issues", "split this prd",
+            "mr-prd-to-issues".
+  NOT for: Creating a PRD (use mr-idea-to-prd), implementing an issue (use mr-issue-to-pr),
+           filing a bug (use archon-create-issue).
+
+  Interactive workflow. Reads a parent PRD issue, drafts vertical slices using the
+  `to-issues` skill, quizzes the user on granularity / dependencies / HITL-AFK flags,
+  iterates until approved, then creates child issues linked to the parent.
+
+  DAG:
+  1. fetch-prd (bash) — gh issue view of the parent PRD issue
+  2. draft-slices (sonnet + to-issues skill) — propose tracer-bullet slices
+  3. slices-gate — capture user's approval or revisions
+  4. refine (loop, interactive) — iterate on the slice list until user says "approved"
+  5. create-issues — gh issue create for each approved slice (in dependency order)
+  6. report — summary linking parent and children
+
+provider: claude
+interactive: true
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH — Get the PRD issue
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-prd-issue
+    prompt: |
+      Find the PRD GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit number (#42, "issue 42", "42"), extract it.
+      - If ambiguous, run `gh issue list --label prd --state open` and pick the most recent.
+        If multiple PRDs are open, ask the user to disambiguate.
+
+      CRITICAL: Output must be ONLY the bare number, no quotes, no explanation. Example: 42
+    model: haiku
+    allowed_tools: [Bash]
+
+  - id: fetch-prd
+    bash: |
+      ISSUE_NUM=$(echo "$extract-prd-issue.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "ERROR: Could not extract issue number from: $extract-prd-issue.output" >&2
+        exit 1
+      fi
+
+      gh issue view "$ISSUE_NUM" --json number,title,body,labels,state,url
+
+      # Sanity-check: is this actually a PRD?
+      LABELS=$(gh issue view "$ISSUE_NUM" --json labels --jq '[.labels[].name] | join(",")')
+      if ! echo "$LABELS" | grep -q "prd"; then
+        echo "" >&2
+        echo "WARNING: Issue #$ISSUE_NUM does not have the 'prd' label. Continuing anyway, but verify this is the right input." >&2
+      fi
+
+      echo "$ISSUE_NUM" > "$ARTIFACTS_DIR/.prd-issue-number"
+    depends_on: [extract-prd-issue]
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: DRAFT — Propose vertical slices
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: draft-slices
+    model: sonnet
+    skills:
+      - to-issues
+    prompt: |
+      You are decomposing a PRD into independently-grabbable GitHub issues for the
+      **Sales-Finder** project, using the `to-issues` skill (preloaded).
+
+      ## Parent PRD
+
+      $fetch-prd.output
+
+      ## Step 1: Re-read the codebase
+
+      Sales-Finder layout:
+      - `backend/app/models/`, `backend/app/api/`, `backend/app/services/`
+      - `backend/alembic/versions/`
+      - `frontend/app/`, `frontend/components/`, `frontend/lib/`
+
+      For each area mentioned in the PRD's "Implementation Decisions", read the actual files
+      so your slices reference real entities.
+
+      ## Step 2: Draft tracer-bullet slices
+
+      Per the `to-issues` skill rules:
+      - Each slice cuts through ALL integration layers end-to-end (schema → API → UI → tests),
+        NOT a horizontal slice of one layer.
+      - A completed slice is demoable on its own.
+      - Prefer many thin slices over few thick ones.
+      - Mark each slice as **HITL** (needs human design call) or **AFK** (can be implemented
+        autonomously). Prefer AFK where possible.
+
+      ## Step 3: Present the proposal
+
+      Present the breakdown as a numbered list. For each slice:
+
+      ```
+      ### Slice N: {short imperative title}
+
+      - **Type**: HITL or AFK
+      - **Blocked by**: #{n} (if any) or "None — can start immediately"
+      - **User stories covered**: {list from PRD's User Stories section}
+      - **What it builds**: 2-3 sentences end-to-end (schema change → API change → UI change → tests)
+      - **Why this slice**: why it's the right granularity
+      ```
+
+      End the message with the quiz:
+
+      ```
+      ## Questions for you
+
+      1. Does the granularity feel right? Too coarse / too fine?
+      2. Are the dependency relationships correct?
+      3. Should any slices be merged or split further?
+      4. Are HITL/AFK flags right?
+      5. Anything missing that the PRD covered but no slice handles?
+
+      Reply with feedback to refine, or say **approved** to proceed to issue creation.
+      ```
+
+      Do NOT create any issues yet. The next step is the user gate.
+    depends_on: [fetch-prd]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: REFINE — Loop until approved
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: refine-slices
+    depends_on: [draft-slices]
+    loop:
+      prompt: |
+        # Refine Slice Breakdown
+
+        The user is reviewing the slice breakdown.
+
+        **User's latest input**: $LOOP_USER_INPUT
+
+        ---
+
+        ## Step 1: Re-load context
+
+        ```bash
+        ISSUE_NUM=$(cat "$ARTIFACTS_DIR/.prd-issue-number")
+        gh issue view "$ISSUE_NUM" --json title,body
+        ```
+
+        Re-read your previous draft (it's in your prior message in this loop).
+
+        ## Step 2: Process feedback
+
+        **If $LOOP_USER_INPUT is empty (first iteration):**
+        - This shouldn't happen on a real refine loop — but be defensive.
+        - Re-present the current slice list and ask for feedback.
+        - Do NOT emit the completion signal.
+
+        **If the user EXPLICITLY approved** — they said "approved", "looks good", "proceed", "ship it",
+        "go", "create them", or equivalent CLEAR approval:
+        - Output: "Slice breakdown approved. Creating issues now."
+        - Signal: `<promise>SLICES_APPROVED</promise>`
+
+        **If the user provided specific feedback (split, merge, retitle, change deps, change HITL/AFK):**
+        1. Update your slice list to apply each piece of feedback
+        2. Show the revised list with the changes called out:
+           ```
+           ## Revised Breakdown
+
+           Changes from previous version:
+           - {what changed}
+           - {what changed}
+
+           {full revised slice list}
+           ```
+        3. Ask: "Anything else, or say **approved** to proceed?"
+
+        **If the user asked questions** — answer them, do NOT signal approval.
+
+        **If the user is unclear** — ask a clarifying question, do NOT signal approval.
+
+        ## CRITICAL Rule
+
+        NEVER emit `<promise>SLICES_APPROVED</promise>` unless the user's latest message
+        contains a CLEAR explicit approval phrase. Questions, suggestions, "what about X" — these
+        are NOT approval. Only emit the signal when the user is unambiguously saying "go".
+
+        ## Step 3: Persist current slice list to disk
+
+        Always write the latest slice list to `$ARTIFACTS_DIR/slices.md` so the next phase can
+        read it after this loop ends:
+
+        ```bash
+        cat > "$ARTIFACTS_DIR/slices.md" <<'EOF'
+        # Approved Slices for PRD #{n}
+
+        ## Slice 1: ...
+        ...
+        EOF
+        ```
+      until: SLICES_APPROVED
+      max_iterations: 10
+      interactive: true
+      gate_message: |
+        Review the slice breakdown above. Reply with feedback to revise (split/merge/reorder/retitle),
+        or say "approved" to create the GitHub issues.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: CREATE — Create child issues in dependency order
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-issues
+    depends_on: [refine-slices]
+    context: fresh
+    prompt: |
+      Create the approved child GitHub issues, in dependency order.
+
+      ## Step 1: Load approved slices
+
+      ```bash
+      cat "$ARTIFACTS_DIR/slices.md"
+      PRD_NUM=$(cat "$ARTIFACTS_DIR/.prd-issue-number")
+      PRD_URL=$(gh issue view "$PRD_NUM" --json url --jq '.url')
+      ```
+
+      ## Step 2: Topological sort
+
+      Order slices so blockers come BEFORE blocked slices. If slice 3 is blocked by slice 1,
+      create #1 first so #3's body can reference its real number.
+
+      ## Step 3: For each slice (in order)
+
+      ```bash
+      gh issue create \
+        --title "{slice title}" \
+        --label "{HITL or AFK}" \
+        --body "$(cat <<'EOF'
+      ## Parent
+
+      #{PRD_NUM}
+
+      ## What to build
+
+      {1-3 sentences describing the end-to-end behavior of this slice — schema → API → UI → tests}
+
+      ## Acceptance criteria
+
+      - [ ] {criterion 1 — testable through public interface}
+      - [ ] {criterion 2}
+      - [ ] {criterion 3}
+      - [ ] Tests added (pytest for backend, vitest for frontend) covering the criteria above
+      - [ ] No regression in existing tests
+
+      ## Blocked by
+
+      {Either: list of `#{real_issue_num}` for each blocker
+       OR: "None — can start immediately"}
+
+      ## User stories covered (from PRD)
+
+      - {US-1 from PRD}
+      - {US-2 from PRD}
+
+      ---
+
+      *Auto-split from PRD #{PRD_NUM} by Archon workflow `$WORKFLOW_ID`*
+      EOF
+      )"
+      ```
+
+      **Capture each new issue number** so subsequent slices can reference real numbers in their
+      "Blocked by" sections:
+
+      ```bash
+      NEW_NUM=$(gh issue list --state open --limit 1 --json number --jq '.[0].number')
+      ```
+
+      Maintain a mapping: `slice_label → real_issue_number`.
+
+      ## Step 4: Ensure labels exist
+
+      Before creating, ensure `HITL` and `AFK` labels exist:
+
+      ```bash
+      gh label list --limit 200 | grep -q '^HITL' || \
+        gh label create HITL --color "D93F0B" --description "Human-in-the-loop required"
+      gh label list --limit 200 | grep -q '^AFK' || \
+        gh label create AFK --color "0E8A16" --description "Can be implemented autonomously"
+      ```
+
+      ## Step 5: Comment on parent PRD with the full split
+
+      ```bash
+      gh issue comment "$PRD_NUM" --body "$(cat <<'EOF'
+      ## 🎯 PRD Split into Implementation Issues
+
+      The PRD has been broken into the following tracer-bullet slices:
+
+      | # | Title | Type | Blocked by |
+      |---|-------|------|------------|
+      | #{n1} | {title 1} | AFK | None |
+      | #{n2} | {title 2} | AFK | #{n1} |
+      | #{n3} | {title 3} | HITL | #{n1} |
+
+      Filter all children: `gh issue list --search "linked:$PRD_NUM"`
+      Or: `gh issue list --label AFK` / `gh issue list --label HITL`
+
+      To implement an AFK issue: `archon workflow run mr-issue-to-pr --branch fix/issue-{N} "Fix issue #{N}"`
+
+      ---
+
+      *Split by Archon workflow `$WORKFLOW_ID`*
+      EOF
+      )"
+      ```
+
+      ## Step 6: Final summary
+
+      ```markdown
+      ## PRD Split Complete
+
+      **Parent**: #{PRD_NUM} — {PRD_URL}
+      **Children created**: {count}
+
+      | # | Title | Type | Blocked by |
+      |---|-------|------|------------|
+      | #{n} | {title} | AFK/HITL | #{n} or None |
+
+      ### Next Steps
+
+      - To implement an AFK issue:
+        `archon workflow run mr-issue-to-pr --branch fix/issue-{N} "Fix issue #{N}"`
+      - HITL issues need a design conversation first.
+      ```

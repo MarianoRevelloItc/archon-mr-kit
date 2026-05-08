@@ -1,0 +1,12 @@
+# Add these lines to your project's .gitignore.
+# IMPORTANT: only `.archon/mcp/` is ignored — workflows/ and commands/ MUST be committed.
+
+# Archon — workflow definitions are committed; only ignore mcp/ (env vars / secrets)
+.archon/mcp/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
