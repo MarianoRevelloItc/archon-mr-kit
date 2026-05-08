@@ -35,3 +35,9 @@ jobs:
           cp -R . "$TMP/"
           cd "$TMP"
           bash scripts/test-bootstrap.sh
+
+      - name: Run mr-kit-sync synthetic test
+        # Builds two synthetic v0.1.0 → v0.2.0 scenarios and asserts the 3-way merge
+        # logic applies clean upgrades and emits conflict markers (without auto-resolving)
+        # when local edits clash with upstream.
+        run: bash scripts/test-kit-sync.sh

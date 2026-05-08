@@ -1,0 +1,389 @@
+name: mr-kit-sync
+description: |
+  Use when: User wants to upgrade this project's archon-mr-kit version (pull updates from
+            the kit repo without losing local edits). Pulls the latest tag, performs a
+            3-way merge for each kit-tracked file, fails loudly on conflict.
+  Triggers: "mr kit sync", "upgrade kit", "pull kit updates", "sync archon kit",
+            "mr-kit-sync".
+  NOT for: Initial bootstrap (use mr-bootstrap-project), one-off file copies (do those by hand).
+
+  Mechanism (3-way merge):
+    1. Add the kit GitHub URL as the `kit` git remote (idempotent).
+    2. Fetch tags from `kit`.
+    3. Read .archon/KIT_VERSION (`from`).
+    4. Resolve `to` from --target-version arg or latest tag on kit.
+    5. For each kit-tracked path:
+         BASE   = kit/$from:path  (upstream at our current version)
+         OURS   = current local file
+         THEIRS = kit/$to:path    (upstream at target version)
+       git merge-file --diff3 → clean merge applied; conflicts leave conflict markers.
+    6. If any conflicts: fail loudly. Human resolves and re-runs.
+    7. On success: bump KIT_VERSION to `to`, commit on branch `kit-sync/$from-to-$to`, open PR.
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: PRECHECK — git state + KIT_VERSION present
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: precheck
+    bash: |
+      set -e
+      git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "ERROR: not a git repo"; exit 1; }
+
+      # Working tree must be clean — sync rewrites tracked files
+      if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "ERROR: working tree has uncommitted changes. Commit or stash before mr-kit-sync."
+        git status --short
+        exit 1
+      fi
+
+      if [ ! -f .archon/KIT_VERSION ]; then
+        echo "ERROR: .archon/KIT_VERSION missing. This repo wasn't bootstrapped from archon-mr-kit, or the bootstrap is from before v0.1.0."
+        exit 1
+      fi
+
+      FROM=$(tr -d '[:space:]' < .archon/KIT_VERSION)
+      echo "FROM_VERSION=$FROM"
+      echo "$FROM" > "$ARTIFACTS_DIR/.from-version"
+      echo "PRECHECK_OK"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: ADD KIT REMOTE — idempotent
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: add-kit-remote
+    bash: |
+      set -e
+      KIT_URL="https://github.com/MarianoRevelloItc/archon-mr-kit.git"
+
+      if git remote get-url kit >/dev/null 2>&1; then
+        EXISTING=$(git remote get-url kit)
+        if [ "$EXISTING" != "$KIT_URL" ]; then
+          echo "WARNING: 'kit' remote exists but points to '$EXISTING' (expected $KIT_URL)"
+          echo "Updating kit remote URL"
+          git remote set-url kit "$KIT_URL"
+        else
+          echo "Skipped: 'kit' remote already configured"
+        fi
+      else
+        git remote add kit "$KIT_URL"
+        echo "Added: kit remote → $KIT_URL"
+      fi
+
+      git fetch kit --tags --quiet
+      git fetch kit main --quiet
+      echo "Fetched: kit tags + main"
+    depends_on: [precheck]
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: RESOLVE TARGET VERSION
+  # If --target-version=X.Y.Z is in the message, use that. Else: latest tag.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: resolve-target-version
+    bash: |
+      set -e
+      FROM=$(cat "$ARTIFACTS_DIR/.from-version")
+
+      # Parse --target-version=X.Y.Z from $ARGUMENTS (best-effort)
+      TARGET=$(echo "$ARGUMENTS" | grep -oE -- '--target-version=[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^--target-version=//')
+
+      if [ -z "$TARGET" ]; then
+        # Latest semver tag on the kit remote
+        TARGET=$(git tag --list 'v*' --sort=-v:refname | head -1 | sed 's/^v//')
+        if [ -z "$TARGET" ]; then
+          echo "ERROR: no semver tag (vX.Y.Z) found on kit remote"
+          exit 1
+        fi
+        echo "TARGET=$TARGET (latest tag on kit)"
+      else
+        echo "TARGET=$TARGET (--target-version arg)"
+      fi
+
+      if [ "$FROM" = "$TARGET" ]; then
+        echo "Already at version $TARGET — nothing to sync."
+        echo "$TARGET" > "$ARTIFACTS_DIR/.to-version"
+        echo "ALREADY_UP_TO_DATE=1" > "$ARTIFACTS_DIR/.sync-state"
+        exit 0
+      fi
+
+      # Verify both refs exist on the kit remote
+      if ! git rev-parse --verify "refs/tags/v$FROM" >/dev/null 2>&1 && ! git rev-parse --verify "kit/$FROM" >/dev/null 2>&1; then
+        echo "WARNING: 'v$FROM' not a tag on kit. Trying 'kit/main' as base — this is best-effort."
+        BASE_REF="kit/main"
+      else
+        BASE_REF="v$FROM"
+      fi
+
+      if ! git rev-parse --verify "refs/tags/v$TARGET" >/dev/null 2>&1; then
+        echo "ERROR: target tag 'v$TARGET' not found on kit remote"
+        exit 1
+      fi
+      TARGET_REF="v$TARGET"
+
+      echo "$TARGET" > "$ARTIFACTS_DIR/.to-version"
+      echo "$BASE_REF" > "$ARTIFACTS_DIR/.base-ref"
+      echo "$TARGET_REF" > "$ARTIFACTS_DIR/.target-ref"
+      echo "Will sync: $FROM ($BASE_REF) → $TARGET ($TARGET_REF)"
+    depends_on: [add-kit-remote]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: 3-WAY MERGE — for each kit-tracked path
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: three-way-merge
+    bash: |
+      set -e
+
+      # Short-circuit if already up to date
+      if [ -f "$ARTIFACTS_DIR/.sync-state" ] && grep -q ALREADY_UP_TO_DATE "$ARTIFACTS_DIR/.sync-state"; then
+        echo "Skipped: already up to date"
+        exit 0
+      fi
+
+      FROM=$(cat "$ARTIFACTS_DIR/.from-version")
+      TO=$(cat "$ARTIFACTS_DIR/.to-version")
+      BASE_REF=$(cat "$ARTIFACTS_DIR/.base-ref")
+      TARGET_REF=$(cat "$ARTIFACTS_DIR/.target-ref")
+
+      BRANCH="kit-sync/${FROM}-to-${TO}"
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      echo "$BRANCH" > "$ARTIFACTS_DIR/.sync-branch"
+
+      # Paths the kit tracks (any change here → 3-way merge)
+      # Conservative list: things bootstrap creates / edits in target repo + kit-internal artifacts.
+      # We use `git ls-tree` against $TARGET_REF to enumerate, then filter to these prefixes.
+      KIT_PATHS=(
+        ".archon/workflows"
+        ".archon/commands"
+        ".archon/CHANGELOG.md"
+        ".archon/KIT_VERSION"
+        ".claude/skills"
+        ".claude/agents"
+        ".claude/hooks"
+        "MR-Archon.md"
+        "scripts/test-bootstrap.sh"
+        "docs/SKILLS-CATALOG.md"
+        ".github/workflows/template-smoke.yml"
+      )
+
+      MERGED=0
+      CONFLICTED=0
+      ADDED=0
+      DELETED_UPSTREAM=0
+      mkdir -p "$ARTIFACTS_DIR/.sync-conflicts"
+      : > "$ARTIFACTS_DIR/.sync-conflict-list"
+      : > "$ARTIFACTS_DIR/.sync-changed-list"
+
+      # Build the union of files at BASE_REF and TARGET_REF under each prefix
+      for prefix in "${KIT_PATHS[@]}"; do
+        # Files at TARGET (upstream wants these to exist)
+        TARGET_FILES=$(git ls-tree -r --name-only "$TARGET_REF" -- "$prefix" 2>/dev/null || true)
+        # Files at BASE (we previously had these from upstream)
+        BASE_FILES=$(git ls-tree -r --name-only "$BASE_REF" -- "$prefix" 2>/dev/null || true)
+        # Union of both
+        ALL_FILES=$(printf '%s\n%s\n' "$TARGET_FILES" "$BASE_FILES" | sort -u | sed '/^$/d')
+
+        for f in $ALL_FILES; do
+          IN_BASE=0; IN_TARGET=0; IN_OURS=0
+          git cat-file -e "$BASE_REF:$f" 2>/dev/null && IN_BASE=1 || true
+          git cat-file -e "$TARGET_REF:$f" 2>/dev/null && IN_TARGET=1 || true
+          [ -f "$f" ] && IN_OURS=1 || true
+
+          # Case A: file added upstream (not in BASE, in TARGET) — copy if not in OURS, else merge with empty BASE
+          # Case B: file deleted upstream (in BASE, not in TARGET) — flag for human (don't auto-delete local edits)
+          # Case C: file in all 3 — 3-way merge
+          # Case D: file only in OURS, not in BASE / TARGET — leave alone (it's local-only)
+
+          if [ "$IN_BASE" = "0" ] && [ "$IN_TARGET" = "1" ] && [ "$IN_OURS" = "0" ]; then
+            # New upstream file, no local override — accept
+            mkdir -p "$(dirname "$f")"
+            git cat-file blob "$TARGET_REF:$f" > "$f"
+            echo "ADDED  $f" | tee -a "$ARTIFACTS_DIR/.sync-changed-list"
+            ADDED=$((ADDED + 1))
+            continue
+          fi
+
+          if [ "$IN_BASE" = "0" ] && [ "$IN_TARGET" = "1" ] && [ "$IN_OURS" = "1" ]; then
+            # Both upstream and we added it independently — 3-way with empty base
+            BASE_FILE=$(mktemp); : > "$BASE_FILE"
+            OURS_FILE=$(mktemp); cp "$f" "$OURS_FILE"
+            THEIRS_FILE=$(mktemp); git cat-file blob "$TARGET_REF:$f" > "$THEIRS_FILE"
+            if git merge-file --diff3 -L "OURS ($f)" -L "BASE (kit $FROM)" -L "THEIRS (kit $TO)" "$OURS_FILE" "$BASE_FILE" "$THEIRS_FILE" >/dev/null 2>&1; then
+              cp "$OURS_FILE" "$f"
+              echo "MERGED $f" | tee -a "$ARTIFACTS_DIR/.sync-changed-list"
+              MERGED=$((MERGED + 1))
+            else
+              cp "$OURS_FILE" "$f"
+              echo "CONFLICT $f" | tee -a "$ARTIFACTS_DIR/.sync-conflict-list"
+              CONFLICTED=$((CONFLICTED + 1))
+            fi
+            rm -f "$BASE_FILE" "$OURS_FILE" "$THEIRS_FILE"
+            continue
+          fi
+
+          if [ "$IN_BASE" = "1" ] && [ "$IN_TARGET" = "0" ]; then
+            # Upstream deleted; we may or may not still have it
+            if [ "$IN_OURS" = "1" ]; then
+              echo "DELETED_UPSTREAM_BUT_LOCAL_PRESENT $f (kept — review and decide)" | tee -a "$ARTIFACTS_DIR/.sync-conflict-list"
+              DELETED_UPSTREAM=$((DELETED_UPSTREAM + 1))
+            else
+              echo "ALREADY_DELETED $f" | tee -a "$ARTIFACTS_DIR/.sync-changed-list"
+            fi
+            continue
+          fi
+
+          if [ "$IN_BASE" = "1" ] && [ "$IN_TARGET" = "1" ] && [ "$IN_OURS" = "1" ]; then
+            # 3-way merge
+            BASE_FILE=$(mktemp); git cat-file blob "$BASE_REF:$f" > "$BASE_FILE"
+            OURS_FILE=$(mktemp); cp "$f" "$OURS_FILE"
+            THEIRS_FILE=$(mktemp); git cat-file blob "$TARGET_REF:$f" > "$THEIRS_FILE"
+            # If OURS == BASE (we never edited locally), just take THEIRS
+            if cmp -s "$OURS_FILE" "$BASE_FILE"; then
+              cp "$THEIRS_FILE" "$f"
+              echo "FAST_FORWARD $f" | tee -a "$ARTIFACTS_DIR/.sync-changed-list"
+              MERGED=$((MERGED + 1))
+            elif git merge-file --diff3 -L "OURS ($f)" -L "BASE (kit $FROM)" -L "THEIRS (kit $TO)" "$OURS_FILE" "$BASE_FILE" "$THEIRS_FILE" >/dev/null 2>&1; then
+              cp "$OURS_FILE" "$f"
+              echo "MERGED $f" | tee -a "$ARTIFACTS_DIR/.sync-changed-list"
+              MERGED=$((MERGED + 1))
+            else
+              # Conflict: copy the merge-file output (with conflict markers) into place
+              cp "$OURS_FILE" "$f"
+              echo "CONFLICT $f" | tee -a "$ARTIFACTS_DIR/.sync-conflict-list"
+              CONFLICTED=$((CONFLICTED + 1))
+            fi
+            rm -f "$BASE_FILE" "$OURS_FILE" "$THEIRS_FILE"
+            continue
+          fi
+
+          if [ "$IN_BASE" = "1" ] && [ "$IN_TARGET" = "1" ] && [ "$IN_OURS" = "0" ]; then
+            # We deleted it locally; upstream still has it. Respect local deletion (no-op).
+            echo "LOCAL_DELETED $f (upstream has it; kept deleted)" | tee -a "$ARTIFACTS_DIR/.sync-changed-list"
+          fi
+        done
+      done
+
+      # Always bump KIT_VERSION (independent of conflicts — but only if the merge is committed)
+      echo "$TO" > .archon/KIT_VERSION
+
+      echo ""
+      echo "=== Sync summary ==="
+      echo "Merged:           $MERGED"
+      echo "Added:            $ADDED"
+      echo "Conflicted:       $CONFLICTED"
+      echo "Deleted upstream: $DELETED_UPSTREAM"
+      echo "===================="
+
+      if [ "$CONFLICTED" -gt 0 ] || [ "$DELETED_UPSTREAM" -gt 0 ]; then
+        echo ""
+        echo "CONFLICTS FOUND — files with conflict markers (or upstream-deleted files still present):"
+        cat "$ARTIFACTS_DIR/.sync-conflict-list"
+        echo ""
+        echo "Resolve each, run: git add -A && git commit -m 'kit-sync: resolve conflicts $FROM → $TO'"
+        echo "Then re-run mr-kit-sync to open the PR (it will detect the resolved state)."
+        exit 2
+      fi
+
+      echo "SYNC_CLEAN"
+    depends_on: [resolve-target-version]
+    timeout: 300000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: COMMIT + PR — only on clean merge
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: commit-and-pr
+    bash: |
+      set -e
+
+      if [ -f "$ARTIFACTS_DIR/.sync-state" ] && grep -q ALREADY_UP_TO_DATE "$ARTIFACTS_DIR/.sync-state"; then
+        echo "Skipped: nothing to commit (already up to date)"
+        exit 0
+      fi
+
+      FROM=$(cat "$ARTIFACTS_DIR/.from-version")
+      TO=$(cat "$ARTIFACTS_DIR/.to-version")
+      BRANCH=$(cat "$ARTIFACTS_DIR/.sync-branch")
+
+      # Ensure 'kit-sync' label exists (idempotent)
+      if ! gh label list --limit 200 | grep -q '^kit-sync\b'; then
+        gh label create kit-sync --color "5319E7" --description "Auto-opened by mr-kit-sync" || true
+      fi
+
+      git add -A
+      if git diff --cached --quiet; then
+        echo "No changes to commit (no upstream deltas applied)"
+        # Bring KIT_VERSION back to source-of-truth on disk just in case
+        git checkout -- .archon/KIT_VERSION 2>/dev/null || true
+        exit 0
+      fi
+
+      CHANGED_COUNT=$(wc -l < "$ARTIFACTS_DIR/.sync-changed-list" | tr -d ' ')
+
+      # Build the commit message via printf (avoid heredoc indent gotchas inside YAML literal block)
+      COMMIT_MSG="chore(kit): sync archon-mr-kit $FROM → $TO
+
+      Auto-generated by mr-kit-sync. Merged $CHANGED_COUNT kit-tracked files via 3-way merge.
+
+      See artifact: \$ARTIFACTS_DIR/.sync-changed-list for the file list."
+      git commit -m "$COMMIT_MSG"
+
+      git push -u origin "$BRANCH"
+
+      # Build PR body in a temp file to avoid heredoc-in-YAML issues
+      PR_BODY=$(mktemp)
+      {
+        printf 'Auto-generated by `mr-kit-sync`.\n\n'
+        printf '## What this does\n\n'
+        printf 'Pulls updates from `archon-mr-kit` %s → %s via 3-way merge. Local edits to\n' "$FROM" "$TO"
+        printf "kit-tracked files are preserved when they don't conflict with upstream changes.\n\n"
+        printf '## Files changed\n\n'
+        printf '```\n'
+        head -50 "$ARTIFACTS_DIR/.sync-changed-list" 2>/dev/null || echo "(none)"
+        printf '```\n\n'
+        printf '## Review\n\n'
+        printf -- '- [ ] CHANGELOG entry for %s matches what landed\n' "$TO"
+        printf -- "- [ ] No conflict markers in the diff (\`grep -rE '<<<<<<< |>>>>>>> ' .archon .claude\`)\n"
+        printf -- '- [ ] Local kit overrides intentionally kept\n'
+      } > "$PR_BODY"
+
+      gh pr create \
+        --title "chore(kit): sync archon-mr-kit $FROM → $TO" \
+        --label kit-sync \
+        --body-file "$PR_BODY"
+      rm -f "$PR_BODY"
+
+      PR_URL=$(gh pr view --json url -q '.url')
+      echo "Created PR: $PR_URL"
+    depends_on: [three-way-merge]
+    timeout: 120000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    bash: |
+      set -e
+      FROM=$(cat "$ARTIFACTS_DIR/.from-version" 2>/dev/null || echo "?")
+      TO=$(cat "$ARTIFACTS_DIR/.to-version" 2>/dev/null || echo "?")
+
+      echo "=================================================="
+      echo "mr-kit-sync — final state"
+      echo "=================================================="
+      echo "From:        $FROM"
+      echo "To:          $TO"
+      echo "Branch:      $(cat $ARTIFACTS_DIR/.sync-branch 2>/dev/null || echo 'n/a')"
+      echo ""
+      if [ -s "$ARTIFACTS_DIR/.sync-conflict-list" ]; then
+        echo "CONFLICTS FOUND — manual resolution required:"
+        cat "$ARTIFACTS_DIR/.sync-conflict-list"
+      else
+        echo "Clean sync — PR opened with label kit-sync"
+      fi
+    depends_on: [commit-and-pr]
