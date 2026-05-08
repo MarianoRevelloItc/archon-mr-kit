@@ -309,6 +309,44 @@ Si saturás el rate limit del LLM o de Brave en runs paralelos: bajá `MAX_CONCU
 
 ---
 
+## 5.5 Skills catalog and loading model
+
+El kit ship con un set de skills (en `.claude/skills/<name>/SKILL.md`) que cargan de dos formas distintas:
+
+**1. Description-driven autoload** (la default)
+
+Claude Code lee el campo `description:` del frontmatter de cada SKILL.md y carga el skill automáticamente cuando el mensaje del usuario / contexto matchea. Skills con descriptions tight cargan poco; descriptions broad cargan mucho.
+
+**2. YAML force-load** (opcional, en workflows)
+
+Un nodo de workflow puede declarar `skills: [<name>, ...]` — esto **pinea** el skill en el contexto de ese nodo cada vez que corre, independientemente del matcher.
+
+```yaml
+- id: implement
+  command: mr-tdd-implement
+  skills:
+    - tdd          # ← force-load: tdd siempre estará disponible en este nodo
+```
+
+> **Cuándo usar force-load:** solo cuando el skill es **requerido en cada run** del nodo. Cuesta context tokens corra o no. Para todo lo demás (skills que solo aplican en algunos casos), confiar en autoload.
+
+### Buckets
+
+El kit organiza sus skills en buckets según loading:
+
+- **Universal default-on** (`kit-router`, `archon`) — descriptions broad, casi siempre cargan.
+- **Universal default-off** — descriptions tight, cargan on-demand. Aquí viven la mayoría: `tdd`, `to-prd`, `to-issues`, `grill-me`, `improve-codebase-architecture`, `security-and-hardening`, `debugging-and-error-recovery`, `documentation-and-adrs`, `source-driven-development`.
+- **Stack-specific** — `mr-bootstrap-project` los copia desde `.claude/skills/_optional/` al repo target solo si detecta el stack matching (React/Vue → frontend-ui-engineering + browser-testing; CI present → ci-cd-and-automation).
+- **Personas** — `.claude/agents/<name>.md`, NO autoloaded. Se invocan vía `Agent`/`Task` tool desde un command. Hoy: `security-auditor` (invocado por `mr-deep-review`).
+
+Ver `docs/SKILLS-CATALOG.md` para la tabla completa con triggers por skill.
+
+### El meta-skill `kit-router`
+
+Cuando el agente arranca un workflow run y no está seguro qué skill aplica, debería consultar `kit-router` — es un índice meta que lista todos los otros skills con un trigger de una línea cada uno. Permite self-routing sin escanear el catálogo entero.
+
+---
+
 ## 6. Apéndice: comandos de uso frecuente del kit
 
 ```bash

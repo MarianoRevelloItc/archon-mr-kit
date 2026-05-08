@@ -141,10 +141,29 @@ else:
         print(f"  {rel}{suffix} OK")
 
 # 3. Skills --------------------------------------------------------------
+# Each skill must have a SKILL.md with frontmatter declaring `name:` and `description:`
+# (Anthropic's Claude Code skill convention — without these, autoload won't trigger).
 print("[skills]")
 skills_present = list_skills()
 for name in sorted(skills_present):
     checked += 1
+    skill_md = SKILLS / name / "SKILL.md"
+    if "/" in name:  # _optional/<n>
+        skill_md = SKILLS / name / "SKILL.md"
+    try:
+        fm, _ = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        fail(f".claude/skills/{name}/SKILL.md", f"frontmatter parse error: {exc}")
+        print(f"  .claude/skills/{name} FAIL")
+        continue
+    missing = [k for k in ("name", "description") if k not in fm]
+    if missing:
+        fail(
+            f".claude/skills/{name}/SKILL.md",
+            f"frontmatter missing keys: {', '.join(missing)}",
+        )
+        print(f"  .claude/skills/{name} FAIL")
+        continue
     print(f"  .claude/skills/{name} OK")
 
 # 4. requires_skills exist --------------------------------------------------
