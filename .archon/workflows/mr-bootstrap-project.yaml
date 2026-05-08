@@ -306,7 +306,486 @@ nodes:
     depends_on: [render-claude-md, update-gitignore, create-labels, pr-template]
 
   # ═══════════════════════════════════════════════════════════════
-  # PHASE 8: REPORT
+  # PHASE 8b: SCAFFOLD DOCS — ADRs + SECURITY + runbook + session-start hook
+  # Idempotent: each block checks whether the file already exists before writing.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: scaffold-docs
+    bash: |
+      set -e
+      mkdir -p docs/adr docs/runbook .claude/hooks
+
+      # ---------- ADR 0001 — Nygard's canonical "Use ADRs" record ----------
+      ADR_0001="docs/adr/0001-record-architecture-decisions.md"
+      if [ ! -f "$ADR_0001" ]; then
+        cat > "$ADR_0001" <<'EOF'
+      # 1. Record architecture decisions
+
+      Date: TODO_DATE
+
+      ## Status
+
+      Accepted
+
+      ## Context
+
+      We need to record the architectural decisions made on this project.
+
+      ## Decision
+
+      We will use Architecture Decision Records, as [described by Michael Nygard](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions).
+
+      ## Consequences
+
+      See Michael Nygard's article, linked above. For a lightweight ADR toolset, see
+      Nat Pryce's [adr-tools](https://github.com/npryce/adr-tools).
+      EOF
+        # Replace TODO_DATE with today's date (portable: macOS + GNU)
+        TODAY=$(date +%Y-%m-%d)
+        sed -i.bak "s/TODO_DATE/$TODAY/" "$ADR_0001" && rm -f "$ADR_0001.bak"
+        echo "Created: $ADR_0001"
+      else
+        echo "Skipped: $ADR_0001 already exists"
+      fi
+
+      # ---------- ADR 0002 — TDD policy ----------
+      ADR_0002="docs/adr/0002-this-project-uses-tdd.md"
+      if [ ! -f "$ADR_0002" ]; then
+        cat > "$ADR_0002" <<'EOF'
+      # 2. This project uses TDD (Test-Driven Development)
+
+      Date: TODO_DATE
+
+      ## Status
+
+      Accepted
+
+      ## Context
+
+      The `mr-issue-to-pr` workflow force-loads the `tdd` skill on the implement node, which
+      enforces a strict red-green-refactor loop with vertical slices: one observable behavior
+      per RED → GREEN cycle, no production code without a failing test. This convention is
+      load-bearing for the kit's quality gates (`mr-multi-validate` assumes tests exist for
+      every behavior).
+
+      ## Decision
+
+      We adopt strict TDD as the project standard for any code change implemented by the kit:
+
+      - Every behavior gets a failing test first (RED).
+      - Minimum code to pass (GREEN).
+      - Refactor only with tests green.
+      - Tests verify behavior through public interfaces, not implementation details
+        (see `.claude/skills/tdd/tests.md`).
+      - One commit per AC (or per tightly-coupled AC group).
+
+      ## Consequences
+
+      **Positive:**
+      - Tests describe what the system *does*, surviving refactors.
+      - `git bisect` is trivial — every commit is small and atomic.
+      - Code review fits in 30 minutes per PR.
+      - The `tdd` skill is force-loaded on the `implement` node, so this convention is
+        applied automatically without per-developer ceremony.
+
+      **Negative:**
+      - More commits / smaller PRs to track. Mitigated by `mr-prd-to-issues` which scopes
+        each issue to one acceptance criterion.
+      - Onboarding cost for engineers unfamiliar with TDD. Mitigated by the `tdd` skill's
+        worked examples and the kit's anti-pattern documentation (no horizontal slicing,
+        no implementation tests).
+      - Real-time pressure can tempt skipping tests. Resist — the test cost is paid back
+        within ~3 PRs by reduced regression debugging.
+
+      ## See also
+
+      - `.claude/skills/tdd/SKILL.md` — the methodology in detail.
+      - `mr-issue-to-pr.yaml` — the workflow that enforces this on implement.
+      - ADR-0001 — why we use ADRs.
+      EOF
+        TODAY=$(date +%Y-%m-%d)
+        sed -i.bak "s/TODO_DATE/$TODAY/" "$ADR_0002" && rm -f "$ADR_0002.bak"
+        echo "Created: $ADR_0002"
+      else
+        echo "Skipped: $ADR_0002 already exists"
+      fi
+
+      # ---------- ADR template ----------
+      ADR_TEMPLATE="docs/adr/TEMPLATE.md"
+      if [ ! -f "$ADR_TEMPLATE" ]; then
+        cat > "$ADR_TEMPLATE" <<'EOF'
+      # NUMBER. TITLE
+
+      Date: YYYY-MM-DD
+
+      ## Status
+
+      Proposed | Accepted | Deprecated | Superseded by ADR-NNNN
+
+      ## Context
+
+      What is the issue we're trying to solve? What forces are at play (technical, political,
+      social, project)? Describe the situation, NOT the solution.
+
+      ## Decision
+
+      The change we're proposing or have agreed to. Active voice, present tense:
+      "We will use X."
+
+      ## Consequences
+
+      What becomes easier or harder as a result? Both positive and negative. Be honest —
+      sweeping consequences under the rug makes the ADR useless when someone six months from
+      now asks "why did we do this?"
+      EOF
+        echo "Created: $ADR_TEMPLATE"
+      else
+        echo "Skipped: $ADR_TEMPLATE already exists"
+      fi
+
+      # ---------- SECURITY.md (stack-aware) ----------
+      SECURITY="docs/SECURITY.md"
+      if [ ! -f "$SECURITY" ]; then
+        # Build the file in pieces so the stack-aware blocks are conditional
+        cat > "$SECURITY" <<'EOF'
+      # Security baseline
+
+      This document is the security floor for this project. The `security-and-hardening`
+      skill (`.claude/skills/security-and-hardening/SKILL.md`) is the deeper reference.
+
+      ## Reporting a vulnerability
+
+      Email security@TODO_DOMAIN. Do NOT open a public GitHub issue for a vulnerability
+      until it has been triaged and (if needed) patched.
+
+      ## Threat model (high-level)
+
+      TODO: enumerate the assets, attackers, and trust boundaries specific to this project.
+      A useful starting question: "What's the worst thing that could happen if this service
+      were taken over?"
+
+      ## The 5 axes (from the security-and-hardening skill)
+
+      Every PR that touches an external surface must address all five:
+
+      1. **Input validation** — every byte from a trust-boundary is hostile until proven safe.
+      2. **Authentication & session** — bcrypt/argon2id, short-TTL tokens, CSRF protection.
+      3. **Secrets** — never in git, never in logs, never in client bundles. Rotation procedure
+         documented in `docs/runbook/INCIDENT.md`.
+      4. **Dependencies** — audit on every PR; pin versions; trim transitive deps.
+      5. **Observability** — log auth events; alert on anomalies; audit trail for admin actions.
+
+      ## Pre-deploy checklist
+
+      ```
+      [ ] Every HTTP input goes through a typed schema validator
+      [ ] Passwords stored with bcrypt/argon2id (cost ≥ 10)
+      [ ] CSRF token on every state-changing cookie endpoint
+      [ ] No secrets in git history (run `git secrets --scan` or trufflehog)
+      [ ] No secrets in logs (search the log file for KEY/TOKEN/PASSWORD)
+      [ ] Dependency audit clean (no HIGH/CRITICAL in prod deps)
+      [ ] Rate limits on /login, /signup, /password-reset, /token
+      [ ] HTTPS enforced (HSTS header, redirect HTTP → HTTPS)
+      [ ] CSP header set (no `unsafe-inline` or `unsafe-eval` in script-src)
+      [ ] CORS origin allowlist is explicit (no `*` for credentialed endpoints)
+      [ ] Auth events logged with user ID + IP + timestamp
+      ```
+
+      EOF
+
+        # Stack-specific guidance
+        if [ -f pyproject.toml ] || [ -f backend/pyproject.toml ]; then
+          cat >> "$SECURITY" <<'EOF'
+      ## Python guidance (pyproject.toml detected)
+
+      - Run `pip-audit` (or `uv pip audit`) on every PR. Fail the PR on HIGH/CRITICAL CVEs in
+        production deps. Add to CI: `pip install pip-audit && pip-audit -r requirements.txt`.
+      - **FastAPI**: never set `debug=True` in production (leaks the stack trace and admin
+        routes). Use `pydantic` models for every request body — never raw `dict`.
+      - **Flask**: set `app.config['SECRET_KEY']` from env var (NEVER hardcode); use
+        `Flask-WTF` for CSRF on form endpoints; never trust `request.values` blindly.
+      - **SQLAlchemy**: parameterized queries via the ORM or `text(...).bindparams(...)`.
+        Never f-string a query.
+      - **Django**: enable `SECURE_HSTS_SECONDS`, `SECURE_SSL_REDIRECT`, `SESSION_COOKIE_SECURE`,
+        `CSRF_COOKIE_SECURE` in production settings. Run `python manage.py check --deploy`.
+      - **httpx / requests**: explicit `verify=True` (default, but make it explicit if disabled
+        for staging — and never disable in prod). Set timeouts on every outbound call.
+
+      EOF
+        fi
+
+        if [ -f package.json ] || [ -f frontend/package.json ]; then
+          cat >> "$SECURITY" <<'EOF'
+      ## Node guidance (package.json detected)
+
+      - Run `npm audit --production` on every PR. Fail the PR on HIGH/CRITICAL CVEs in
+        production deps. Consider Socket.dev for supply-chain monitoring.
+      - **Express**: use `helmet` middleware (sets CSP, HSTS, X-Frame-Options, etc.). Set
+        `app.disable('x-powered-by')`. Validate every body with `zod` / `joi` — never trust
+        `req.body` blindly.
+      - **Next.js**: set CSP headers in `next.config.js`; never expose secrets in
+        `NEXT_PUBLIC_*` env vars (those go in client bundles); use Server Components for
+        anything that touches secrets.
+      - **React**: never `dangerouslySetInnerHTML` user content. Sanitize markdown with
+        `DOMPurify` before rendering.
+      - **JWT**: prefer `jose` over the (deprecated) `jsonwebtoken` for new code. Use HS256
+        for symmetric, RS256 for asymmetric. Verify `aud`, `iss`, `exp` on every decode.
+
+      EOF
+        fi
+
+        if [ ! -f pyproject.toml ] && [ ! -f backend/pyproject.toml ] && [ ! -f package.json ] && [ ! -f frontend/package.json ]; then
+          cat >> "$SECURITY" <<'EOF'
+      ## Stack-specific guidance
+
+      TODO: stack-aware enrichment. (No `pyproject.toml` or `package.json` detected at
+      bootstrap time.) Re-run `mr-bootstrap-project` after adding your dependency manifest,
+      or fill in this section by hand referencing your stack's CVE database and security
+      best-practice docs.
+
+      EOF
+        fi
+
+        # Trailer (footer reference)
+        cat >> "$SECURITY" <<'EOF'
+      ## See also
+
+      - `.claude/skills/security-and-hardening/SKILL.md` — full anti-rationalization table and
+        per-axis details.
+      - `docs/runbook/INCIDENT.md` — what to do when something breaks in production.
+      - OWASP Top 10 — https://owasp.org/www-project-top-ten/
+      EOF
+        echo "Created: $SECURITY"
+      else
+        echo "Skipped: $SECURITY already exists"
+      fi
+
+      # ---------- Runbook: INCIDENT.md ----------
+      INCIDENT="docs/runbook/INCIDENT.md"
+      if [ ! -f "$INCIDENT" ]; then
+        cat > "$INCIDENT" <<'EOF'
+      # Incident playbook
+
+      What to do when something is broken in production. Walk this in order.
+
+      ## Detection
+
+      How do we know something is wrong? TODO: list the signals.
+
+      - [ ] Alerting: TODO — link to the alerting dashboard (Datadog / Grafana / PagerDuty / etc.)
+      - [ ] Log aggregation: TODO — link to the log search UI
+      - [ ] Health-check endpoint: TODO — `curl https://your.app/healthz` should return 200
+      - [ ] User reports: TODO — channel where users report bugs (Intercom, support@, Slack)
+
+      ## Triage
+
+      Within the first 5 minutes:
+
+      - [ ] Acknowledge the alert (silences pages, notifies the team).
+      - [ ] Assess blast radius: 1 user, 1% of users, 100% of users? Read-only outage or
+            data corruption?
+      - [ ] Decide: rollback (see `ROLLBACK.md`), forward-fix, or shed load (rate-limit / disable
+            feature flag).
+
+      ## Communication
+
+      - [ ] Post in #incidents (TODO: channel name) with: severity, blast radius, current
+            understanding, ETA to next update.
+      - [ ] If user-facing, update the status page (TODO: status page URL).
+      - [ ] Update every 15 minutes minimum, even if the update is "still investigating".
+
+      ## Mitigation
+
+      Restore service first, root-cause later. Options in order of safety:
+
+      1. **Rollback**: revert to last-known-good deploy (see `ROLLBACK.md`).
+      2. **Feature flag**: disable the offending code path without a deploy.
+      3. **Rate limit / shed load**: protect the hot path.
+      4. **Forward-fix**: only if rollback would lose data and the fix is small and reviewed.
+
+      ## Post-mortem
+
+      Within 48 hours of resolution, write a blameless post-mortem. Sections:
+
+      - **Summary** — 2 sentences.
+      - **Timeline** — minute-by-minute, with timestamps.
+      - **Root cause** — what actually broke.
+      - **Why we didn't catch it earlier** — gap in tests, alerting, review.
+      - **Action items** — specific, owned, dated. Open as GitHub issues with label `incident-followup`.
+
+      Post-mortem template: TODO — link to or copy a template into `docs/runbook/POSTMORTEM-TEMPLATE.md`.
+      EOF
+        echo "Created: $INCIDENT"
+      else
+        echo "Skipped: $INCIDENT already exists"
+      fi
+
+      # ---------- Runbook: ROLLBACK.md ----------
+      ROLLBACK="docs/runbook/ROLLBACK.md"
+      if [ ! -f "$ROLLBACK" ]; then
+        cat > "$ROLLBACK" <<'EOF'
+      # Rollback playbook
+
+      How to revert to last-known-good when production is broken.
+
+      ## Pre-flight
+
+      - [ ] Identify last-known-good deploy: TODO (commit SHA, deploy ID, container tag).
+      - [ ] Confirm with one other engineer before rolling back if the rollback would lose
+            data (e.g., a migration that added required columns).
+
+      ## Steps
+
+      TODO: replace with your actual rollback procedure. Examples:
+
+      ```bash
+      # Kubernetes
+      kubectl rollout undo deployment/<name>
+
+      # Container platform
+      gcloud run services update-traffic <service> --to-revisions=<previous-revision>=100
+
+      # Vercel / Netlify
+      # Use the platform UI to promote a previous deploy
+      ```
+
+      ## Verification
+
+      - [ ] Health-check endpoint returns 200.
+      - [ ] One smoke-test workflow passes end-to-end.
+      - [ ] User reports stop arriving.
+
+      ## Post-rollback
+
+      - [ ] Tag the bad commit so future bisects skip it: `git tag bad-deploy/<date>` and push.
+      - [ ] Open a GitHub issue with label `rollback` describing what broke and why we rolled back.
+      - [ ] Forward-fix in a new PR — do NOT cherry-pick the offending commit back.
+      EOF
+        echo "Created: $ROLLBACK"
+      else
+        echo "Skipped: $ROLLBACK already exists"
+      fi
+
+      # ---------- Runbook: MONITORING.md ----------
+      MONITORING="docs/runbook/MONITORING.md"
+      if [ ! -f "$MONITORING" ]; then
+        cat > "$MONITORING" <<'EOF'
+      # Monitoring playbook
+
+      What we observe, where, and what alerts fire.
+
+      ## Dashboards
+
+      TODO: list the dashboards a person on-call should bookmark.
+
+      - [ ] Service health: TODO — link
+      - [ ] Latency / error rate: TODO — link
+      - [ ] Database: TODO — link
+      - [ ] Business metrics: TODO — link
+
+      ## Alerts
+
+      TODO: list every alert and what it means.
+
+      | Alert | Threshold | Severity | First action |
+      |-------|-----------|----------|--------------|
+      | Error rate > X% | TODO | page | Check service health dashboard |
+      | p99 latency > Y ms | TODO | warn | Check load + DB pool |
+      | DB connection pool > Z% | TODO | warn | Check long-running queries |
+
+      ## SLOs
+
+      TODO: define the SLO for each user-facing endpoint and the error budget.
+
+      | Endpoint | SLO | Error budget (monthly) |
+      |----------|-----|------------------------|
+      | GET /healthz | 99.9% | 43 minutes |
+      | POST /api/v1/... | TODO | TODO |
+
+      ## What to do when an alert fires
+
+      Always: open `INCIDENT.md`. Treat every page as a real incident until proven otherwise.
+      EOF
+        echo "Created: $MONITORING"
+      else
+        echo "Skipped: $MONITORING already exists"
+      fi
+
+      # ---------- Session-start hook ----------
+      HOOK=".claude/hooks/session-start.sh"
+      if [ ! -f "$HOOK" ]; then
+        cat > "$HOOK" <<'EOF'
+      #!/usr/bin/env bash
+      # Archon session-start hook — prints a 5-line quickstart.
+      # Must be fast and non-blocking. No network, no heavy git ops.
+      set -e
+
+      cat <<MSG
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      archon-mr-kit — quickstart
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      1. Define your idea:        archon workflow run mr-idea-to-prd --branch prd/<name> "<idea>"
+      2. PRD → child issues:      archon workflow run mr-prd-to-issues --branch chore/split-prd-N "split #N"
+      3. Issue → PR (manual):     archon workflow run mr-issue-to-pr --branch fix/issue-N "Fix #N"
+      4. Issue → PR (auto-merge): archon workflow run mr-issue-to-pr-ralph --branch fix/issue-N "Fix #N"
+      5. Validate the kit:        bash scripts/test-bootstrap.sh
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      MSG
+      EOF
+        chmod +x "$HOOK"
+        echo "Created: $HOOK"
+      else
+        echo "Skipped: $HOOK already exists"
+      fi
+
+      echo ""
+      echo "SCAFFOLD_DOCS_OK"
+    depends_on: [verify]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 8c: TRACKING ISSUE — open a 'bootstrap-todo' issue for runbook completion
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: bootstrap-todo-issue
+    bash: |
+      set -e
+
+      # Create the label if missing (idempotent)
+      if gh label list --limit 200 | grep -q '^bootstrap-todo\b'; then
+        echo "Skipped: label 'bootstrap-todo' already exists"
+      else
+        gh label create bootstrap-todo --color "C5DEF5" --description "Tracking — fill in scaffolded TODOs from mr-bootstrap-project" || true
+        echo "Created: label bootstrap-todo"
+      fi
+
+      # If there's already an open bootstrap-todo issue with this title, skip
+      EXISTING=$(gh issue list --label bootstrap-todo --state open --json number,title --jq '.[] | select(.title | startswith("Bootstrap TODO")) | .number' | head -1)
+      if [ -n "$EXISTING" ]; then
+        echo "Skipped: bootstrap-todo issue #$EXISTING already open"
+        exit 0
+      fi
+
+      gh issue create \
+        --title "Bootstrap TODO: fill INCIDENT.md, ROLLBACK.md, MONITORING.md before first prod deploy" \
+        --label bootstrap-todo \
+        --body "$(cat <<'BODY'
+      The \`mr-bootstrap-project\` workflow scaffolded these runbook files with TODO markers.
+      Before the first production deploy, fill them in:
+
+      - [ ] \`docs/runbook/INCIDENT.md\` — Detection / Triage / Communication / Mitigation / Post-mortem
+      - [ ] \`docs/runbook/ROLLBACK.md\` — Pre-flight, steps, verification
+      - [ ] \`docs/runbook/MONITORING.md\` — Dashboards, alerts, SLOs
+      - [ ] \`docs/SECURITY.md\` — replace \`TODO_DOMAIN\` with your security contact, fill threat model
+      - [ ] \`docs/adr/0001-record-architecture-decisions.md\` and \`0002-this-project-uses-tdd.md\` — review and adapt to project-specific context
+      - [ ] Search the repo for \`TODO\` markers introduced by bootstrap and replace them
+      BODY
+      )"
+      echo "Created: bootstrap-todo issue"
+    depends_on: [scaffold-docs]
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 9: REPORT
   # ═══════════════════════════════════════════════════════════════
 
   - id: report
@@ -317,6 +796,8 @@ nodes:
       cat .archon/config.yaml
       ls .archon/workflows/ 2>/dev/null
       ls .archon/commands/ 2>/dev/null
+      ls docs/adr/ 2>/dev/null
+      ls docs/runbook/ 2>/dev/null
       ```
 
       Then output:
@@ -328,8 +809,13 @@ nodes:
       - `.archon/` (workflows/, commands/, config.yaml)
       - `CLAUDE.md` ({CREATED|EXISTS})
       - `.gitignore` updated (only `.archon/mcp/` ignored)
-      - GitHub labels: `prd`, `auto-followup`, `HITL`, `AFK`, `needs-human-review`
+      - GitHub labels: `prd`, `auto-followup`, `HITL`, `AFK`, `needs-human-review`, `bootstrap-todo`
       - `.github/pull_request_template.md` ({CREATED|EXISTS})
+      - `docs/adr/0001-record-architecture-decisions.md`, `0002-this-project-uses-tdd.md`, `TEMPLATE.md`
+      - `docs/SECURITY.md` (stack-aware: enriched if pyproject.toml or package.json present)
+      - `docs/runbook/INCIDENT.md`, `ROLLBACK.md`, `MONITORING.md`
+      - `.claude/hooks/session-start.sh`
+      - GitHub issue: "Bootstrap TODO: fill INCIDENT.md, ROLLBACK.md, MONITORING.md..." (label `bootstrap-todo`)
 
       ### Workflows installed
       {list of mr-* yaml files in .archon/workflows/, or "(none yet — drop in the mr-* kit)"}
@@ -340,14 +826,13 @@ nodes:
          - `mr-idea-to-prd.yaml`
          - `mr-prd-to-issues.yaml`
          - `mr-issue-to-pr.yaml`
-      4. (Optional) For batch processing N issues in parallel, use the documented
-         `nohup` pattern in MANUAL.md — there's no batch workflow YAML; the
-         spawn-detached bash pattern is more robust than nesting workflows.
       2. Drop the mr-* command files into `.archon/commands/`:
          - `mr-tdd-implement.md`
          - `mr-multi-validate.md`
          - `mr-promote-followups.md`
       3. Run `archon validate workflows mr-issue-to-pr` to confirm everything wires up.
-      4. Start your first PRD: `archon workflow run mr-idea-to-prd --branch prd/{name} "{idea}"`
+      4. Run `bash scripts/test-bootstrap.sh` to validate kit integrity.
+      5. Fill in the `bootstrap-todo` issue's runbook TODOs before first prod deploy.
+      6. Start your first PRD: `archon workflow run mr-idea-to-prd --branch prd/{name} "{idea}"`
       ```
-    depends_on: [verify]
+    depends_on: [verify, scaffold-docs, bootstrap-todo-issue]
